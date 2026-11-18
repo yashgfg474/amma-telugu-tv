@@ -63,7 +63,7 @@ public class MainActivity extends AppCompatActivity {
         channelGrid = findViewById(R.id.channelGrid);
 
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        currentTvIp = prefs.getString(KEY_TV_IP, "10.203.242.129");
+        currentTvIp = prefs.getString(KEY_TV_IP, "192.168.29.25");
 
         try {
             adbClient = new AdbClient(this);
@@ -167,9 +167,21 @@ public class MainActivity extends AppCompatActivity {
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                         .edit().putString(KEY_TV_IP, currentTvIp).apply();
                 try {
-                    String model = adbClient.runShellCommand(currentTvIp, 5555, "getprop ro.product.model", 3500).trim();
+                    String props = adbClient.runShellCommand(currentTvIp, 5555,
+                            "getprop ro.product.model; getprop ro.build.characteristics", 3500).trim();
+                    String[] lines = props.split("\\r?\\n");
+                    String model = lines.length > 0 && !lines[0].trim().isEmpty() ? lines[0].trim() : "Living Room TV";
+                    String chars = lines.length > 1 ? lines[1].trim() : "";
+                    if (!chars.contains("tv") && !TvDiscovery.isAndroidTv(currentTvIp, 350)) {
+                        currentTvIp = "";
+                        runOnUiThread(() -> {
+                            tvStatus.setText("🔴 Found non-TV device — Tap 'TV IP' to re-scan");
+                            tvStatus.setTextColor(Color.parseColor("#EF5350"));
+                        });
+                        return;
+                    }
                     runOnUiThread(() -> {
-                        tvStatus.setText("🟢 Connected: Living Room TV (" + currentTvIp + ")");
+                        tvStatus.setText("🟢 Connected: " + model + " (" + currentTvIp + ")");
                         tvStatus.setTextColor(Color.parseColor("#4CAF50"));
                     });
                 } catch (Exception e) {
@@ -222,6 +234,14 @@ public class MainActivity extends AppCompatActivity {
         vibrateShort();
         executor.execute(() -> {
             try {
+                String ip = TvDiscovery.findTvIp(MainActivity.this, currentTvIp);
+                if (ip == null) {
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this, "TV not reachable on Wi-Fi!", Toast.LENGTH_SHORT).show());
+                    return;
+                }
+                currentTvIp = ip;
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .edit().putString(KEY_TV_IP, currentTvIp).apply();
                 adbClient.runShellCommand(currentTvIp, 5555, "input keyevent " + keycode, 3000);
                 runOnUiThread(() -> tvStatus.setText("🟢 Sent: " + label));
             } catch (Exception e) {
