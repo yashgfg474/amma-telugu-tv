@@ -1,4 +1,4 @@
-name: Build Amma Telugu TV APK
+name: Build TeluCast APK
 
 on:
   push:
@@ -32,20 +32,20 @@ jobs:
 
       - name: Copy APK to root for easy download
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk ./Amma-Telugu-TV.apk
+          cp app/build/outputs/apk/debug/app-debug.apk ./TeluCast.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Amma-Telugu-TV-APK
-          path: ./Amma-Telugu-TV.apk
+          name: TeluCast-APK
+          path: ./TeluCast.apk
 
       - name: Create GitHub Release with APK
         uses: softprops/action-gh-release@v2
-        if: always()
+        if: success()
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "Amma Telugu TV App v1.0.${{ github.run_number }}"
-          files: ./Amma-Telugu-TV.apk
+          tag_name: v2.0.${{ github.run_number }}
+          name: "TeluCast v2.0.${{ github.run_number }}"
+          files: ./TeluCast.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

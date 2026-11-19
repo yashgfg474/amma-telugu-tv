@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TeluCast" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/accent_gold</item>
+        <item name="colorPrimaryVariant">@color/accent_gold_bright</item>
+        <item name="colorOnPrimary">@color/text_on_gold</item>
+        <item name="colorSecondary">@color/accent_crimson</item>
+        <item name="colorSecondaryVariant">@color/accent_crimson</item>
+        <item name="colorOnSecondary">@color/text_primary</item>
+        <item name="android:windowBackground">@color/bg_canvas</item>
+        <item name="android:statusBarColor">@color/bg_canvas</item>
+        <item name="android:navigationBarColor">@color/bg_surface</item>
+        <item name="android:colorBackground">@color/bg_canvas</item>
+        <item name="colorSurface">@color/bg_surface</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+    </style>
+</resources>

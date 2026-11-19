@@ -6,6 +6,7 @@ import android.util.Base64;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -15,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.PrivateKey;
 import java.security.spec.PKCS8EncodedKeySpec;
+
 import javax.crypto.Cipher;
 
 public class AdbClient {
@@ -26,6 +28,7 @@ public class AdbClient {
     private static final int A_WRTE = 0x45545257;
     private static final int VERSION = 0x01000000;
     private static final int MAX_PAYLOAD = 4096;
+    private static final int MAX_INBOUND_PAYLOAD = 1024 * 1024;
 
     private static final int ADB_AUTH_TOKEN = 1;
     private static final int ADB_AUTH_SIGNATURE = 2;
@@ -39,6 +42,14 @@ public class AdbClient {
 
     private final PrivateKey privateKey;
     private final byte[] publicKeyBytes;
+    private final Object connLock = new Object();
+
+    private Socket socket;
+    private DataInputStream in;
+    private DataOutputStream out;
+    private String connectedHost;
+    private int connectedPort = -1;
+    private int nextLocalId = 1;
 
     public AdbClient(Context context) throws Exception {
         String privPem = readAssetText(context, "adbkey");
@@ -54,7 +65,7 @@ public class AdbClient {
 
         ByteArrayOutputStream pubOut = new ByteArrayOutputStream();
         pubOut.write(pubText.getBytes(StandardCharsets.UTF_8));
-        pubOut.write(0); // null-terminated
+        pubOut.write(0);
         this.publicKeyBytes = pubOut.toByteArray();
     }
 
@@ -71,67 +82,148 @@ public class AdbClient {
     }
 
     public String runShellCommand(String host, int port, String command, int timeoutMs) throws Exception {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 2500);
-            socket.setSoTimeout(timeoutMs);
-            socket.setTcpNoDelay(true);
+        if (host == null || host.trim().isEmpty()) {
+            throw new IOException("TV IP not set");
+        }
+        synchronized (connLock) {
+            boolean wasReused = isConnectedToLocked(host, port);
+            if (!wasReused) {
+                connectLocked(host, port, timeoutMs);
+            }
+            try {
+                return executeShellLocked(command, timeoutMs);
+            } catch (Exception firstError) {
+                closeLocked();
+                if (!wasReused) {
+                    throw firstError;
+                }
+                // Reused TCP socket may have gone stale (e.g., TV slept/restarted); reconnect once
+                connectLocked(host, port, timeoutMs);
+                try {
+                    return executeShellLocked(command, timeoutMs);
+                } catch (Exception retryError) {
+                    closeLocked();
+                    throw retryError;
+                }
+            }
+        }
+    }
 
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+    public void close() {
+        synchronized (connLock) {
+            closeLocked();
+        }
+    }
 
-            // 1. Send CNXN
+    private boolean isConnectedToLocked(String host, int port) {
+        return socket != null
+                && !socket.isClosed()
+                && socket.isConnected()
+                && host.equals(connectedHost)
+                && connectedPort == port;
+    }
+
+    private void connectLocked(String host, int port, int timeoutMs) throws Exception {
+        closeLocked();
+        Socket s = new Socket();
+        try {
+            s.connect(new InetSocketAddress(host, port), 2500);
+            s.setSoTimeout(Math.max(timeoutMs, 4000));
+            s.setTcpNoDelay(true);
+
+            DataInputStream dis = new DataInputStream(s.getInputStream());
+            DataOutputStream dos = new DataOutputStream(s.getOutputStream());
+
             byte[] banner = "host::\0".getBytes(StandardCharsets.UTF_8);
-            sendPacket(out, A_CNXN, VERSION, MAX_PAYLOAD, banner);
+            sendPacket(dos, A_CNXN, VERSION, MAX_PAYLOAD, banner);
 
             boolean sentSignature = false;
-            while (true) {
-                AdbPacket pkt = readPacket(in);
+            boolean sentPublicKey = false;
+            for (int step = 0; step < 6; step++) {
+                AdbPacket pkt = readPacket(dis);
                 if (pkt.cmd == A_CNXN) {
-                    break;
+                    this.socket = s;
+                    this.in = dis;
+                    this.out = dos;
+                    this.connectedHost = host;
+                    this.connectedPort = port;
+                    this.nextLocalId = 1;
+                    return;
                 } else if (pkt.cmd == A_AUTH && pkt.arg0 == ADB_AUTH_TOKEN) {
                     if (!sentSignature) {
                         byte[] sig = signToken(pkt.payload);
-                        sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, sig);
+                        sendPacket(dos, A_AUTH, ADB_AUTH_SIGNATURE, 0, sig);
                         sentSignature = true;
+                    } else if (!sentPublicKey) {
+                        sendPacket(dos, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, publicKeyBytes);
+                        sentPublicKey = true;
                     } else {
-                        sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, publicKeyBytes);
+                        throw new IOException("TV rejected ADB authorization");
                     }
                 } else {
-                    throw new Exception("Unexpected ADB handshake packet: " + Integer.toHexString(pkt.cmd));
+                    throw new IOException("Unexpected ADB handshake packet: 0x" + Integer.toHexString(pkt.cmd));
                 }
             }
-
-            // 2. Send OPEN for shell:command
-            int localId = 1;
-            byte[] openData = ("shell:" + command + "\0").getBytes(StandardCharsets.UTF_8);
-            sendPacket(out, A_OPEN, localId, 0, openData);
-
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            int remoteId = 0;
-
-            while (true) {
-                AdbPacket pkt;
-                try {
-                    pkt = readPacket(in);
-                } catch (Exception e) {
-                    break;
-                }
-                if (pkt.cmd == A_OKAY) {
-                    remoteId = pkt.arg0;
-                } else if (pkt.cmd == A_WRTE) {
-                    remoteId = pkt.arg0;
-                    if (pkt.payload != null && pkt.payload.length > 0) {
-                        output.write(pkt.payload);
-                    }
-                    sendPacket(out, A_OKAY, localId, remoteId, new byte[0]);
-                } else if (pkt.cmd == A_CLSE) {
-                    sendPacket(out, A_CLSE, localId, remoteId, new byte[0]);
-                    break;
-                }
+            throw new IOException("ADB authentication did not complete");
+        } catch (Exception e) {
+            try {
+                s.close();
+            } catch (Exception ignored) {
             }
-
-            return new String(output.toByteArray(), StandardCharsets.UTF_8);
+            throw e;
         }
+    }
+
+    private String executeShellLocked(String command, int timeoutMs) throws Exception {
+        socket.setSoTimeout(Math.max(timeoutMs, 1500));
+
+        int localId = nextLocalId++;
+        if (nextLocalId > 1_000_000) {
+            nextLocalId = 1;
+        }
+
+        byte[] openData = ("shell:" + command + "\0").getBytes(StandardCharsets.UTF_8);
+        sendPacket(out, A_OPEN, localId, 0, openData);
+
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        int remoteId = 0;
+
+        while (true) {
+            AdbPacket pkt = readPacket(in);
+            if ((pkt.cmd == A_OKAY || pkt.cmd == A_WRTE || pkt.cmd == A_CLSE) && pkt.arg1 != localId) {
+                continue;
+            }
+            if (pkt.cmd == A_OKAY) {
+                remoteId = pkt.arg0;
+            } else if (pkt.cmd == A_WRTE) {
+                remoteId = pkt.arg0;
+                if (pkt.payload != null && pkt.payload.length > 0) {
+                    output.write(pkt.payload);
+                }
+                sendPacket(out, A_OKAY, localId, remoteId, new byte[0]);
+            } else if (pkt.cmd == A_CLSE) {
+                if (remoteId != 0) {
+                    sendPacket(out, A_CLSE, localId, remoteId, new byte[0]);
+                }
+                break;
+            }
+        }
+
+        return new String(output.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    private void closeLocked() {
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (Exception ignored) {
+            }
+        }
+        socket = null;
+        in = null;
+        out = null;
+        connectedHost = null;
+        connectedPort = -1;
     }
 
     private byte[] signToken(byte[] token) throws Exception {
@@ -175,7 +267,14 @@ public class AdbClient {
         int arg1 = hdr.getInt();
         int len = hdr.getInt();
         hdr.getInt(); // checksum
-        hdr.getInt(); // magic
+        int magic = hdr.getInt();
+
+        if (magic != ~cmd) {
+            throw new IOException("Invalid ADB packet magic");
+        }
+        if (len < 0 || len > MAX_INBOUND_PAYLOAD) {
+            throw new IOException("Invalid ADB payload size: " + len);
+        }
 
         byte[] payload = new byte[len];
         if (len > 0) {
