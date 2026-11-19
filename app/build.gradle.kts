@@ -8,10 +8,17 @@ android {
 
     defaultConfig {
         applicationId = "com.yash.ammatv"
-        minSdk = 24
+        minSdk = 21
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+        }
     }
 
     buildTypes {

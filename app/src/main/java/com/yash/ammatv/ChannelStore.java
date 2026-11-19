@@ -20,6 +20,7 @@ public class ChannelStore {
     private static final String KEY_CUSTOM_CHANNELS = "custom_channels_json";
     private static final String KEY_FAVORITES = "favorite_channel_ids";
     private static final String KEY_DIRECT_IDS = "direct_channel_ids_json";
+    private static final String KEY_RECENT_IDS = "recent_channel_ids_json";
 
     private final SharedPreferences prefs;
 
@@ -54,16 +55,21 @@ public class ChannelStore {
         return list;
     }
 
-    public ChannelItem addCustomChannel(String title, String searchQuery, String category, int colorHex) {
+    public ChannelItem addCustomChannel(String title, String searchQuery, String category,
+                                      int colorHex, String directChannelId) {
         List<ChannelItem> existing = getCustomChannels();
         String id = "custom_" + UUID.randomUUID().toString().substring(0, 8);
         ChannelItem item = ChannelItem.createCustom(id, title, category, searchQuery, colorHex);
         existing.add(0, item);
         saveCustomChannels(existing);
+        if (directChannelId != null && !directChannelId.trim().isEmpty()) {
+            saveDirectChannelId(item.id, directChannelId);
+        }
         return item;
     }
 
-    public void updateCustomChannel(String id, String title, String searchQuery, String category, int colorHex) {
+    public void updateCustomChannel(String id, String title, String searchQuery,
+                                    String category, int colorHex, String directChannelId) {
         List<ChannelItem> existing = getCustomChannels();
         List<ChannelItem> updated = new ArrayList<>(existing.size());
         for (ChannelItem c : existing) {
@@ -74,7 +80,11 @@ public class ChannelStore {
             }
         }
         saveCustomChannels(updated);
-        clearDirectChannelId(id);
+        if (directChannelId != null && !directChannelId.trim().isEmpty()) {
+            saveDirectChannelId(id, directChannelId);
+        } else {
+            clearDirectChannelId(id);
+        }
     }
 
     public void deleteCustomChannel(String id) {
@@ -116,10 +126,6 @@ public class ChannelStore {
         return set == null ? new HashSet<>() : new HashSet<>(set);
     }
 
-    public boolean isFavorite(String channelId) {
-        return getFavoriteIds().contains(channelId);
-    }
-
     public boolean toggleFavorite(String channelId) {
         Set<String> favs = getFavoriteIds();
         boolean added;
@@ -132,6 +138,35 @@ public class ChannelStore {
         }
         prefs.edit().putStringSet(KEY_FAVORITES, favs).apply();
         return added;
+    }
+
+    public void recordRecentChannel(String channelId) {
+        if (channelId == null || channelId.trim().isEmpty()) return;
+        List<String> current = getRecentChannelIds();
+        current.remove(channelId);
+        current.add(0, channelId);
+        while (current.size() > 6) {
+            current.remove(current.size() - 1);
+        }
+        JSONArray arr = new JSONArray();
+        for (String id : current) {
+            arr.put(id);
+        }
+        prefs.edit().putString(KEY_RECENT_IDS, arr.toString()).apply();
+    }
+
+    public List<String> getRecentChannelIds() {
+        List<String> list = new ArrayList<>();
+        String raw = prefs.getString(KEY_RECENT_IDS, "[]");
+        try {
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                String id = arr.optString(i, "");
+                if (!id.isEmpty()) list.add(id);
+            }
+        } catch (Exception ignored) {
+        }
+        return list;
     }
 
     public String getDirectChannelId(String channelId) {
