@@ -28,7 +28,6 @@ import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -62,7 +61,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_TV_IP = "tv_ip";
     private static final int VOLUME_STEP = 5;
     private static final int VOLUME_HOLD_STEP = 3;
-    private static final int VOLUME_DEBOUNCE_MS = 120;
+    private static final int VOLUME_DEBOUNCE_MS = 100;
 
     private static final int[] SWATCH_COLORS = new int[]{
             0xFFF59E0B, // Royal Gold
@@ -86,11 +85,8 @@ public class MainActivity extends AppCompatActivity {
     private View viewStatusDot;
     private EditText etSearch;
     private ImageView btnClearSearch;
-    private View btnSearchOnTvBanner;
-    private TextView tvSearchOnTvBannerText;
+    private TextView btnSearchTvInline;
     private LinearLayout categoryBar;
-    private HorizontalScrollView recentStripScroll;
-    private LinearLayout recentStripRow;
     private RecyclerView channelRecycler;
     private View emptyStateView;
 
@@ -111,7 +107,8 @@ public class MainActivity extends AppCompatActivity {
     private ChannelStore channelStore;
     private volatile String currentTvIp = "";
     private volatile String lastKnownSubnet = "";
-    private volatile int currentVolume = 20;
+    private volatile int currentVolume = 35;
+    private volatile int pendingVolumeDelta = 0;
     private volatile boolean isTvVerifiedConnected = false;
     private volatile long lastVerifyAtMs = 0L;
     private boolean isDraggingVolume = false;
@@ -130,24 +127,25 @@ public class MainActivity extends AppCompatActivity {
     private ChannelAdapter adapter;
 
     private final String[] categories = new String[]{
-            "All", "Favorites", "Entertainment", "Movies", "News", "Devotional & Music", "Custom"
+            "All", "Recent", "Favorites", "Entertainment", "Movies", "News", "Devotional & Music", "Custom"
     };
-    private final List<TextView> categoryChips = new ArrayList<>();
 
+    // Unified executor + generation counter for TV screen actions (channel play & TV search never conflict!)
     private final ExecutorService connectExecutor = Executors.newSingleThreadExecutor();
-    private final ExecutorService channelExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService tvScreenExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService remoteExecutor = Executors.newSingleThreadExecutor();
-    private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
 
     private final AtomicInteger connectGeneration = new AtomicInteger(0);
-    private final AtomicInteger playGeneration = new AtomicInteger(0);
-    private final AtomicInteger searchGeneration = new AtomicInteger(0);
+    private final AtomicInteger tvOpGeneration = new AtomicInteger(0);
     private final AtomicInteger pendingRemoteKeys = new AtomicInteger(0);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    private final Runnable volumeSyncRunnable = () -> {
-        final int targetVol = currentVolume;
-        remoteExecutor.execute(() -> sendVolumeToTv(targetVol));
+    private final Runnable volumeDeltaRunnable = () -> {
+        final int delta = pendingVolumeDelta;
+        pendingVolumeDelta = 0;
+        if (delta != 0) {
+            remoteExecutor.execute(() -> sendVolumeDeltaToTv(delta));
+        }
     };
 
     @Override
@@ -170,8 +168,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         reloadChannelData();
-        setupCategories();
-        renderRecentStrip();
+        renderCategoryBar();
         filterChannels();
 
         channelRecycler.setLayoutManager(new GridLayoutManager(this, 2));
@@ -185,7 +182,7 @@ public class MainActivity extends AppCompatActivity {
         setupRemoteControls();
         updateVolumeViews();
 
-        findViewById(R.id.btnStatusPill).setOnClickListener(v -> showIpDialog());
+        findViewById(R.id.btnStatusPill).setOnClickListener(v -> showSettingsDialog());
         findViewById(R.id.btnAddChannel).setOnClickListener(v -> showAddOrEditChannelDialog(null));
 
         registerWifiWatcher();
@@ -228,12 +225,12 @@ public class MainActivity extends AppCompatActivity {
             wifiCallback = new ConnectivityManager.NetworkCallback() {
                 @Override
                 public void onAvailable(@NonNull Network network) {
-                    mainHandler.postDelayed(() -> checkNetworkChangeAndReconnect(), 700);
+                    mainHandler.postDelayed(() -> checkNetworkChangeAndReconnect(), 650);
                 }
 
                 @Override
                 public void onLinkPropertiesChanged(@NonNull Network network, @NonNull LinkProperties linkProperties) {
-                    mainHandler.postDelayed(() -> checkNetworkChangeAndReconnect(), 500);
+                    mainHandler.postDelayed(() -> checkNetworkChangeAndReconnect(), 450);
                 }
             };
             connectivityManager.registerNetworkCallback(req, wifiCallback);
@@ -266,11 +263,8 @@ public class MainActivity extends AppCompatActivity {
         viewStatusDot = findViewById(R.id.viewStatusDot);
         etSearch = findViewById(R.id.etSearch);
         btnClearSearch = findViewById(R.id.btnClearSearch);
-        btnSearchOnTvBanner = findViewById(R.id.btnSearchOnTvBanner);
-        tvSearchOnTvBannerText = findViewById(R.id.tvSearchOnTvBannerText);
+        btnSearchTvInline = findViewById(R.id.btnSearchTvInline);
         categoryBar = findViewById(R.id.categoryBar);
-        recentStripScroll = findViewById(R.id.recentStripScroll);
-        recentStripRow = findViewById(R.id.recentStripRow);
         channelRecycler = findViewById(R.id.channelRecycler);
         emptyStateView = findViewById(R.id.emptyStateView);
 
@@ -298,12 +292,7 @@ public class MainActivity extends AppCompatActivity {
                 currentSearchText = s.toString().trim();
                 boolean hasQuery = !currentSearchText.isEmpty();
                 btnClearSearch.setVisibility(hasQuery ? View.VISIBLE : View.GONE);
-                if (currentSearchText.length() >= 2) {
-                    btnSearchOnTvBanner.setVisibility(View.VISIBLE);
-                    tvSearchOnTvBannerText.setText("Search \"" + currentSearchText + "\" on TV — Pick exact channel");
-                } else {
-                    btnSearchOnTvBanner.setVisibility(View.GONE);
-                }
+                btnSearchTvInline.setVisibility(currentSearchText.length() >= 2 ? View.VISIBLE : View.GONE);
                 filterChannels();
                 adapter.notifyDataSetChanged();
             }
@@ -328,7 +317,7 @@ public class MainActivity extends AppCompatActivity {
             hideKeyboard();
         });
 
-        btnSearchOnTvBanner.setOnClickListener(v -> {
+        btnSearchTvInline.setOnClickListener(v -> {
             hideKeyboard();
             if (!currentSearchText.isEmpty()) {
                 showTvSearchPickerDialog(currentSearchText, null);
@@ -379,7 +368,7 @@ public class MainActivity extends AppCompatActivity {
             pill.setGravity(Gravity.CENTER);
             pill.setSingleLine(true);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(36));
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
             lp.setMargins(0, 0, dp(8), 0);
             pill.setLayoutParams(lp);
             pill.setPadding(dp(14), 0, dp(14), 0);
@@ -398,19 +387,16 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupRemoteControls() {
-        // Quick bar controls (with Hold-to-Repeat on Vol +/-)
         attachHoldToRepeat(findViewById(R.id.btnQuickVolDown), true, () -> stepVolume(-VOLUME_STEP), () -> stepVolume(-VOLUME_HOLD_STEP));
         attachHoldToRepeat(findViewById(R.id.btnQuickVolUp), true, () -> stepVolume(VOLUME_STEP), () -> stepVolume(VOLUME_HOLD_STEP));
         findViewById(R.id.btnQuickMute).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_VOLUME_MUTE, "Mute"));
         findViewById(R.id.btnQuickBack).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_BACK, "Back"));
 
-        // Remote tab utility row
         findViewById(R.id.btnRemPower).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_POWER, "Power"));
         findViewById(R.id.btnRemInput).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_TV_INPUT, "Input"));
         findViewById(R.id.btnRemKeyboard).setOnClickListener(v -> showSendTextDialog());
         findViewById(R.id.btnRemSettings).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_SETTINGS, "Settings"));
 
-        // Circular D-Pad (strictly LTR + Hold-to-Repeat)
         attachHoldToRepeat(findViewById(R.id.btnDpadUp), false,
                 () -> sendKeyCode(KeyEvent.KEYCODE_DPAD_UP, "Up"),
                 () -> sendKeyCode(KeyEvent.KEYCODE_DPAD_UP, "Up"));
@@ -425,12 +411,10 @@ public class MainActivity extends AppCompatActivity {
                 () -> sendKeyCode(KeyEvent.KEYCODE_DPAD_RIGHT, "Right"));
         findViewById(R.id.btnDpadOk).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_DPAD_CENTER, "OK"));
 
-        // Navigation row
         findViewById(R.id.btnRemBack).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_BACK, "Back"));
         findViewById(R.id.btnRemHome).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_HOME, "Home"));
         findViewById(R.id.btnRemMenu).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_MENU, "Menu"));
 
-        // Volume rocker + slider (with Hold-to-Repeat)
         attachHoldToRepeat(findViewById(R.id.btnRemVolUp), true, () -> stepVolume(VOLUME_STEP), () -> stepVolume(VOLUME_HOLD_STEP));
         attachHoldToRepeat(findViewById(R.id.btnRemVolDown), true, () -> stepVolume(-VOLUME_STEP), () -> stepVolume(-VOLUME_HOLD_STEP));
         findViewById(R.id.btnRemMute).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_VOLUME_MUTE, "Mute"));
@@ -454,12 +438,13 @@ public class MainActivity extends AppCompatActivity {
                 isDraggingVolume = false;
                 currentVolume = seekBar.getProgress();
                 vibrateShort();
-                mainHandler.removeCallbacks(volumeSyncRunnable);
-                mainHandler.post(volumeSyncRunnable);
+                pendingVolumeDelta = 0;
+                mainHandler.removeCallbacks(volumeDeltaRunnable);
+                final int exactVol = currentVolume;
+                remoteExecutor.execute(() -> sendExactVolumeToTv(exactVol));
             }
         });
 
-        // Channel & Info (with Hold-to-Repeat on CH +/-)
         attachHoldToRepeat(findViewById(R.id.btnRemChUp), false,
                 () -> sendKeyCode(KeyEvent.KEYCODE_CHANNEL_UP, "CH +"),
                 () -> sendKeyCode(KeyEvent.KEYCODE_CHANNEL_UP, "CH +"));
@@ -468,7 +453,6 @@ public class MainActivity extends AppCompatActivity {
                 () -> sendKeyCode(KeyEvent.KEYCODE_CHANNEL_DOWN, "CH -"));
         findViewById(R.id.btnRemInfo).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_INFO, "Info"));
 
-        // Media transport
         findViewById(R.id.btnRemRew).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_MEDIA_REWIND, "Rewind"));
         findViewById(R.id.btnRemPlayPause).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "Play/Pause"));
         findViewById(R.id.btnRemFwd).setOnClickListener(v -> sendKeyCode(KeyEvent.KEYCODE_MEDIA_FAST_FORWARD, "Forward"));
@@ -481,7 +465,7 @@ public class MainActivity extends AppCompatActivity {
         repeater[0] = () -> {
             if (!target.isPressed() || isUiGone()) return;
             repeatAction.run();
-            mainHandler.postDelayed(repeater[0], isVolume ? 170L : 210L);
+            mainHandler.postDelayed(repeater[0], isVolume ? 150L : 190L);
         };
 
         target.setOnTouchListener((v, event) -> {
@@ -490,7 +474,7 @@ public class MainActivity extends AppCompatActivity {
                 v.setPressed(true);
                 mainHandler.removeCallbacks(repeater[0]);
                 initialAction.run();
-                mainHandler.postDelayed(repeater[0], 360L);
+                mainHandler.postDelayed(repeater[0], 340L);
                 return true;
             } else if (action == MotionEvent.ACTION_UP
                     || action == MotionEvent.ACTION_CANCEL
@@ -514,107 +498,74 @@ public class MainActivity extends AppCompatActivity {
         favoriteIds.addAll(channelStore.getFavoriteIds());
     }
 
-    private void setupCategories() {
+    private void renderCategoryBar() {
         categoryBar.removeAllViews();
-        categoryChips.clear();
+        int goldText = ContextCompat.getColor(this, R.color.text_on_gold);
+        int inactiveText = ContextCompat.getColor(this, R.color.text_secondary);
+
+        // Quick 1-tap "Last" channel switch pill integrated directly in category bar
+        List<String> recentIds = channelStore.getRecentChannelIds();
+        if (recentIds.size() >= 2) {
+            final ChannelItem prev = channelById.get(recentIds.get(1));
+            if (prev != null) {
+                TextView lastChip = new TextView(this);
+                lastChip.setText("Last: " + prev.title);
+                lastChip.setTextSize(12f);
+                lastChip.setSingleLine(true);
+                lastChip.setTypeface(lastChip.getTypeface(), android.graphics.Typeface.BOLD);
+                lastChip.setGravity(Gravity.CENTER);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+                lp.setMargins(dp(4), 0, dp(6), 0);
+                lastChip.setLayoutParams(lp);
+                lastChip.setPadding(dp(12), 0, dp(12), 0);
+                lastChip.setBackgroundResource(R.drawable.bg_remote_power);
+                lastChip.setTextColor(ContextCompat.getColor(this, R.color.text_primary));
+                lastChip.setOnClickListener(v -> onChannelClicked(prev));
+                categoryBar.addView(lastChip);
+            }
+        }
+
         for (final String cat : categories) {
             TextView chip = new TextView(this);
             chip.setText(cat);
-            chip.setTextSize(13f);
+            chip.setTextSize(12.5f);
             chip.setAllCaps(false);
             chip.setSingleLine(true);
             chip.setTypeface(chip.getTypeface(), android.graphics.Typeface.BOLD);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
-            lp.setMargins(dp(4), 0, dp(4), 0);
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
+            lp.setMargins(dp(3), 0, dp(3), 0);
             chip.setLayoutParams(lp);
             chip.setGravity(Gravity.CENTER);
-            chip.setPadding(dp(14), 0, dp(14), 0);
-            chip.setClickable(true);
-            chip.setFocusable(true);
+            chip.setPadding(dp(13), 0, dp(13), 0);
+            boolean active = cat.equals(selectedCategory);
+            chip.setBackgroundResource(active ? R.drawable.bg_chip_active : R.drawable.bg_chip_inactive);
+            chip.setTextColor(active ? goldText : inactiveText);
             chip.setOnClickListener(v -> {
                 selectedCategory = cat;
-                updateCategoryStyles();
+                renderCategoryBar();
                 filterChannels();
                 adapter.notifyDataSetChanged();
             });
             categoryBar.addView(chip);
-            categoryChips.add(chip);
-        }
-        updateCategoryStyles();
-    }
-
-    private void updateCategoryStyles() {
-        int activeText = ContextCompat.getColor(this, R.color.text_on_gold);
-        int inactiveText = ContextCompat.getColor(this, R.color.text_secondary);
-        for (int i = 0; i < categories.length; i++) {
-            TextView chip = categoryChips.get(i);
-            boolean active = categories[i].equals(selectedCategory);
-            chip.setBackgroundResource(active ? R.drawable.bg_chip_active : R.drawable.bg_chip_inactive);
-            chip.setTextColor(active ? activeText : inactiveText);
-        }
-    }
-
-    private void renderRecentStrip() {
-        List<String> recentIds = channelStore.getRecentChannelIds();
-        List<ChannelItem> recentItems = new ArrayList<>();
-        for (String id : recentIds) {
-            ChannelItem c = channelById.get(id);
-            if (c != null) recentItems.add(c);
-        }
-
-        if (recentItems.isEmpty()) {
-            recentStripScroll.setVisibility(View.GONE);
-            return;
-        }
-
-        recentStripScroll.setVisibility(View.VISIBLE);
-        recentStripRow.removeAllViews();
-
-        int goldText = ContextCompat.getColor(this, R.color.text_on_gold);
-        int normalText = ContextCompat.getColor(this, R.color.text_primary);
-
-        // If at least 2 recent channels exist, show quick "Last" switch pill to jump back to previous channel
-        if (recentItems.size() >= 2) {
-            final ChannelItem prev = recentItems.get(1);
-            TextView lastPill = new TextView(this);
-            lastPill.setText("Last: " + prev.title);
-            lastPill.setTextSize(11.5f);
-            lastPill.setTypeface(lastPill.getTypeface(), android.graphics.Typeface.BOLD);
-            lastPill.setSingleLine(true);
-            lastPill.setGravity(Gravity.CENTER);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
-            lp.setMargins(dp(4), 0, dp(6), 0);
-            lastPill.setLayoutParams(lp);
-            lastPill.setPadding(dp(11), 0, dp(11), 0);
-            lastPill.setBackgroundResource(R.drawable.bg_add_btn);
-            lastPill.setTextColor(goldText);
-            lastPill.setOnClickListener(v -> onChannelClicked(prev));
-            recentStripRow.addView(lastPill);
-        }
-
-        for (final ChannelItem item : recentItems) {
-            TextView chip = new TextView(this);
-            chip.setText(item.title);
-            chip.setTextSize(11.5f);
-            chip.setSingleLine(true);
-            chip.setGravity(Gravity.CENTER);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
-            lp.setMargins(0, 0, dp(6), 0);
-            chip.setLayoutParams(lp);
-            chip.setPadding(dp(11), 0, dp(11), 0);
-            chip.setBackgroundResource(R.drawable.bg_chip_inactive);
-            chip.setTextColor(normalText);
-            chip.setOnClickListener(v -> onChannelClicked(item));
-            recentStripRow.addView(chip);
         }
     }
 
     private void filterChannels() {
         filteredChannels.clear();
         String q = currentSearchText.toLowerCase(Locale.ROOT);
+
+        if ("Recent".equals(selectedCategory)) {
+            for (String id : channelStore.getRecentChannelIds()) {
+                ChannelItem item = channelById.get(id);
+                if (item != null && matchesSearchText(item, q)) {
+                    filteredChannels.add(item);
+                }
+            }
+            emptyStateView.setVisibility(filteredChannels.isEmpty() ? View.VISIBLE : View.GONE);
+            return;
+        }
 
         List<ChannelItem> pinnedFavs = new ArrayList<>();
         List<ChannelItem> customOthers = new ArrayList<>();
@@ -632,12 +583,7 @@ public class MainActivity extends AppCompatActivity {
                 catMatch = item.category.equalsIgnoreCase(selectedCategory);
             }
 
-            boolean searchMatch = q.isEmpty()
-                    || item.title.toLowerCase(Locale.ROOT).contains(q)
-                    || item.searchQuery.toLowerCase(Locale.ROOT).contains(q)
-                    || item.badgeCode.toLowerCase(Locale.ROOT).contains(q);
-
-            if (!catMatch || !searchMatch) continue;
+            if (!catMatch || !matchesSearchText(item, q)) continue;
 
             if ("All".equals(selectedCategory) && favoriteIds.contains(item.id)) {
                 pinnedFavs.add(item);
@@ -654,6 +600,13 @@ public class MainActivity extends AppCompatActivity {
         emptyStateView.setVisibility(filteredChannels.isEmpty() ? View.VISIBLE : View.GONE);
     }
 
+    private boolean matchesSearchText(ChannelItem item, String q) {
+        if (q.isEmpty()) return true;
+        return item.title.toLowerCase(Locale.ROOT).contains(q)
+                || item.searchQuery.toLowerCase(Locale.ROOT).contains(q)
+                || item.badgeCode.toLowerCase(Locale.ROOT).contains(q);
+    }
+
     private void autoConnectTv(final boolean networkJustChanged) {
         if (adbClient == null) return;
         final int myConnGen = connectGeneration.incrementAndGet();
@@ -664,7 +617,7 @@ public class MainActivity extends AppCompatActivity {
             String foundIp = TvDiscovery.findTvIp(MainActivity.this, currentTvIp);
             if (foundIp == null && !isUiGone() && connectGeneration.get() == myConnGen) {
                 try {
-                    Thread.sleep(1100);
+                    Thread.sleep(1000);
                 } catch (InterruptedException ignored) {
                     return;
                 }
@@ -733,19 +686,19 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         vibrateShort();
-        final int myGen = playGeneration.incrementAndGet();
+        final int myGen = tvOpGeneration.incrementAndGet();
         loadingChannelId = item.id;
         adapter.notifyDataSetChanged();
         setStatus(R.color.status_sky, "Opening " + item.title + "...");
 
-        channelExecutor.execute(() -> {
-            if (playGeneration.get() != myGen || isUiGone()) return;
+        tvScreenExecutor.execute(() -> {
+            if (tvOpGeneration.get() != myGen || isUiGone()) return;
 
             String ip = ensureTvIpFast();
             if (ip == null) {
                 isTvVerifiedConnected = false;
                 runOnUiThread(() -> {
-                    if (isUiGone() || playGeneration.get() != myGen) return;
+                    if (isUiGone() || tvOpGeneration.get() != myGen) return;
                     loadingChannelId = null;
                     adapter.notifyDataSetChanged();
                     setStatus(R.color.status_red, "TV offline — Check TV Wi-Fi");
@@ -754,25 +707,17 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
-            TvController.CancelCheck cancelCheck = () -> playGeneration.get() != myGen || isUiGone();
+            TvController.CancelCheck cancelCheck = () -> tvOpGeneration.get() != myGen || isUiGone();
             TvController.PlayResult res = TvController.playChannel(adbClient, ip, item, channelStore, cancelCheck);
 
             if (res.connectionError && !cancelCheck.isCancelled()) {
                 isTvVerifiedConnected = false;
                 runOnUiThread(() -> {
-                    if (!isUiGone() && playGeneration.get() == myGen) {
+                    if (!isUiGone() && tvOpGeneration.get() == myGen) {
                         setStatus(R.color.status_amber, "Reconnecting to TV...");
                     }
                 });
                 String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
-                if (newIp == null && !cancelCheck.isCancelled()) {
-                    try {
-                        Thread.sleep(900);
-                        newIp = TvDiscovery.findTvIp(MainActivity.this, "");
-                    } catch (InterruptedException ignored) {
-                        return;
-                    }
-                }
                 if (newIp != null && !cancelCheck.isCancelled()) {
                     currentTvIp = newIp;
                     saveTvIp(newIp);
@@ -780,7 +725,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            if (res.cancelled || playGeneration.get() != myGen || isUiGone()) return;
+            if (res.cancelled || tvOpGeneration.get() != myGen || isUiGone()) return;
 
             final TvController.PlayResult finalRes = res;
             if (!finalRes.connectionError) {
@@ -789,12 +734,12 @@ public class MainActivity extends AppCompatActivity {
             }
 
             runOnUiThread(() -> {
-                if (isUiGone() || playGeneration.get() != myGen) return;
+                if (isUiGone() || tvOpGeneration.get() != myGen) return;
                 loadingChannelId = null;
                 if (finalRes.success) {
                     activeChannelId = item.id;
                     channelStore.recordRecentChannel(item.id);
-                    renderRecentStrip();
+                    renderCategoryBar();
                     setStatus(R.color.status_green, "Playing: " + item.title);
                 } else {
                     setStatus(R.color.status_amber, finalRes.message);
@@ -805,14 +750,16 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void playDirectMatch(final TvController.TvChannelMatch match, final ChannelItem linkToItem) {
+    private void playSearchMatch(final TvController.TvChannelMatch match,
+                                 final TvController.TvSearchSession openSession,
+                                 final ChannelItem linkToItem) {
         if (adbClient == null) return;
         vibrateShort();
-        final int myGen = playGeneration.incrementAndGet();
+        final int myGen = tvOpGeneration.incrementAndGet();
         setStatus(R.color.status_sky, "Playing " + match.displayTitle + "...");
 
-        channelExecutor.execute(() -> {
-            if (playGeneration.get() != myGen || isUiGone()) return;
+        tvScreenExecutor.execute(() -> {
+            if (tvOpGeneration.get() != myGen || isUiGone()) return;
             String ip = ensureTvIpFast();
             if (ip == null) {
                 runOnUiThread(() -> {
@@ -820,36 +767,50 @@ public class MainActivity extends AppCompatActivity {
                 });
                 return;
             }
-            TvController.CancelCheck cancelCheck = () -> playGeneration.get() != myGen || isUiGone();
-            TvController.PlayResult res = TvController.playDirectChannel(
-                    adbClient, ip, match.directId, match.displayTitle, cancelCheck);
+            TvController.CancelCheck cancelCheck = () -> tvOpGeneration.get() != myGen || isUiGone();
+            TvController.PlayResult res = TvController.playSearchMatch(
+                    adbClient, ip, match, openSession, cancelCheck);
             if (res.connectionError && !cancelCheck.isCancelled()) {
                 String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
                 if (newIp != null && !cancelCheck.isCancelled()) {
                     currentTvIp = newIp;
                     saveTvIp(newIp);
-                    res = TvController.playDirectChannel(
-                            adbClient, newIp, match.directId, match.displayTitle, cancelCheck);
+                    res = TvController.playSearchMatch(
+                            adbClient, newIp, match, openSession, cancelCheck);
                 }
             }
-            if (res.cancelled || playGeneration.get() != myGen || isUiGone()) return;
+            if (res.cancelled || tvOpGeneration.get() != myGen || isUiGone()) return;
             final TvController.PlayResult finalRes = res;
             runOnUiThread(() -> {
-                if (isUiGone() || playGeneration.get() != myGen) return;
+                if (isUiGone() || tvOpGeneration.get() != myGen) return;
+                loadingChannelId = null;
                 if (finalRes.success) {
                     if (linkToItem != null) {
                         channelStore.saveDirectChannelId(linkToItem.id, match.directId);
                         activeChannelId = linkToItem.id;
                         channelStore.recordRecentChannel(linkToItem.id);
-                        renderRecentStrip();
-                        adapter.notifyDataSetChanged();
+                        renderCategoryBar();
                     }
+                    adapter.notifyDataSetChanged();
                     setStatus(R.color.status_green, "Playing: " + match.displayTitle);
                 } else {
                     setStatus(R.color.status_amber, finalRes.message);
                     Toast.makeText(MainActivity.this, finalRes.message, Toast.LENGTH_SHORT).show();
                 }
             });
+        });
+    }
+
+    private void dismissSearchSessionQuietly(final TvController.TvSearchSession session) {
+        if (adbClient == null || session == null || !session.isOpenOnTv) return;
+        session.isOpenOnTv = false;
+        final int closeGen = tvOpGeneration.get();
+        tvScreenExecutor.execute(() -> {
+            if (tvOpGeneration.get() != closeGen || isUiGone()) return;
+            String ip = currentTvIp;
+            if (ip != null && !ip.isEmpty()) {
+                TvController.closeTvSearchSession(adbClient, ip);
+            }
         });
     }
 
@@ -869,9 +830,10 @@ public class MainActivity extends AppCompatActivity {
     private void stepVolume(int delta) {
         vibrateShort();
         currentVolume = Math.max(0, Math.min(100, currentVolume + delta));
+        pendingVolumeDelta += delta;
         updateVolumeViews();
-        mainHandler.removeCallbacks(volumeSyncRunnable);
-        mainHandler.postDelayed(volumeSyncRunnable, VOLUME_DEBOUNCE_MS);
+        mainHandler.removeCallbacks(volumeDeltaRunnable);
+        mainHandler.postDelayed(volumeDeltaRunnable, VOLUME_DEBOUNCE_MS);
     }
 
     private void updateVolumeViews() {
@@ -887,7 +849,36 @@ public class MainActivity extends AppCompatActivity {
         if (tvRemoteVolValue != null) tvRemoteVolValue.setText(txt);
     }
 
-    private void sendVolumeToTv(int targetVol) {
+    private void sendVolumeDeltaToTv(int delta) {
+        if (adbClient == null || isUiGone()) return;
+        String ip = ensureTvIpFast();
+        if (ip == null) return;
+        try {
+            TvController.stepVolumeFast(adbClient, ip, delta);
+            runOnUiThread(() -> {
+                if (!isUiGone()) setStatus(R.color.status_green, "Volume: " + currentVolume + "%");
+            });
+        } catch (Exception e) {
+            String rediscovered = TvDiscovery.findTvIp(MainActivity.this, ip);
+            if (rediscovered != null) {
+                currentTvIp = rediscovered;
+                saveTvIp(rediscovered);
+                try {
+                    TvController.stepVolumeFast(adbClient, rediscovered, delta);
+                    runOnUiThread(() -> {
+                        if (!isUiGone()) setStatus(R.color.status_green, "Volume: " + currentVolume + "%");
+                    });
+                    return;
+                } catch (Exception ignored) {
+                }
+            }
+            runOnUiThread(() -> {
+                if (!isUiGone()) setStatus(R.color.status_red, "Volume failed — Check TV Wi-Fi");
+            });
+        }
+    }
+
+    private void sendExactVolumeToTv(int targetVol) {
         if (adbClient == null || isUiGone()) return;
         String ip = ensureTvIpFast();
         if (ip == null) {
@@ -896,13 +887,12 @@ public class MainActivity extends AppCompatActivity {
             });
             return;
         }
-
         try {
             TvController.setVolume(adbClient, ip, targetVol);
             runOnUiThread(() -> {
                 if (!isUiGone()) setStatus(R.color.status_green, "Volume: " + targetVol + "%");
             });
-        } catch (Exception firstErr) {
+        } catch (Exception e) {
             String rediscovered = TvDiscovery.findTvIp(MainActivity.this, ip);
             if (rediscovered != null) {
                 currentTvIp = rediscovered;
@@ -1005,7 +995,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void showSendTextDialog() {
         EditText input = new EditText(this);
-        input.setHint("Type text to send to TV...");
+        input.setHint("Type channel or search query...");
         input.setTextColor(ContextCompat.getColor(this, R.color.text_primary));
         input.setHintTextColor(ContextCompat.getColor(this, R.color.text_muted));
         input.setSingleLine(true);
@@ -1016,7 +1006,7 @@ public class MainActivity extends AppCompatActivity {
         container.addView(input);
 
         new AlertDialog.Builder(this)
-                .setTitle("Send Text to TV")
+                .setTitle("Type / Search on TV")
                 .setView(container)
                 .setPositiveButton("Send", (d, w) -> {
                     String txt = input.getText().toString().trim();
@@ -1025,9 +1015,9 @@ public class MainActivity extends AppCompatActivity {
                             try {
                                 String ip = ensureTvIpFast();
                                 if (ip != null) {
-                                    TvController.sendText(adbClient, ip, txt);
+                                    String msg = TvController.sendText(adbClient, ip, txt);
                                     runOnUiThread(() -> {
-                                        if (!isUiGone()) setStatus(R.color.status_green, "Text sent to TV");
+                                        if (!isUiGone()) setStatus(R.color.status_green, msg);
                                     });
                                 }
                             } catch (Exception e) {
@@ -1042,32 +1032,59 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void showIpDialog() {
-        EditText input = new EditText(this);
-        input.setText(currentTvIp);
-        input.setHint("e.g. 10.251.226.129");
-        input.setTextColor(ContextCompat.getColor(this, R.color.text_primary));
-        input.setHintTextColor(ContextCompat.getColor(this, R.color.text_muted));
-        input.setSingleLine(true);
+    private void showSettingsDialog() {
+        View view = LayoutInflater.from(this).inflate(R.layout.dialog_tv_settings, null);
+        EditText etIp = view.findViewById(R.id.etSettingsTvIp);
+        EditText etM3u = view.findViewById(R.id.etSettingsM3uUrl);
+        TextView tvM3uStatus = view.findViewById(R.id.tvM3uStatus);
 
-        LinearLayout layout = new LinearLayout(this);
-        layout.setOrientation(LinearLayout.VERTICAL);
-        layout.setPadding(dp(20), dp(14), dp(20), dp(8));
-        layout.addView(input);
+        etIp.setText(currentTvIp);
+        etM3u.setText(M3uIndex.getSavedUrl(this));
+        if (M3uIndex.hasCachedPlaylist(this)) {
+            int count = M3uIndex.searchCached(this, "", 10000).size();
+            tvM3uStatus.setVisibility(View.VISIBLE);
+            tvM3uStatus.setText("Cached " + count + " channels locally (0ms silent phone search active)");
+        }
 
         new AlertDialog.Builder(this)
-                .setTitle("TV Wi-Fi Connection")
-                .setMessage("TeluCast auto-finds your TCL TV whenever Wi-Fi changes, or set IP manually.")
-                .setView(layout)
-                .setPositiveButton("Connect", (d, w) -> {
-                    String entered = input.getText().toString().trim();
-                    if (!entered.isEmpty()) {
-                        currentTvIp = entered;
-                        saveTvIp(entered);
+                .setView(view)
+                .setPositiveButton("Save", (d, w) -> {
+                    String enteredIp = etIp.getText().toString().trim();
+                    String enteredM3u = etM3u.getText().toString().trim();
+                    if (!enteredIp.isEmpty()) {
+                        currentTvIp = enteredIp;
+                        saveTvIp(enteredIp);
                     }
                     autoConnectTv(false);
+
+                    String oldM3u = M3uIndex.getSavedUrl(this);
+                    if (enteredM3u.isEmpty()) {
+                        M3uIndex.saveUrl(this, "");
+                    } else if (!enteredM3u.equals(oldM3u) || !M3uIndex.hasCachedPlaylist(this)) {
+                        Toast.makeText(this, "Syncing M3U playlist...", Toast.LENGTH_SHORT).show();
+                        connectExecutor.execute(() -> {
+                            try {
+                                int cnt = M3uIndex.refreshFromUrl(MainActivity.this, enteredM3u);
+                                runOnUiThread(() -> {
+                                    if (!isUiGone()) {
+                                        Toast.makeText(MainActivity.this,
+                                                "Synced " + cnt + " channels for instant search!",
+                                                Toast.LENGTH_LONG).show();
+                                    }
+                                });
+                            } catch (Exception e) {
+                                runOnUiThread(() -> {
+                                    if (!isUiGone()) {
+                                        Toast.makeText(MainActivity.this,
+                                                "M3U sync failed: " + e.getMessage(),
+                                                Toast.LENGTH_LONG).show();
+                                    }
+                                });
+                            }
+                        });
+                    }
                 })
-                .setNeutralButton("Auto Scan", (d, w) -> {
+                .setNeutralButton("Auto Scan TV", (d, w) -> {
                     currentTvIp = "";
                     autoConnectTv(true);
                 })
@@ -1084,114 +1101,176 @@ public class MainActivity extends AppCompatActivity {
         RecyclerView rvPicker = view.findViewById(R.id.rvPickerMatches);
         TextView btnLoadMore = view.findViewById(R.id.btnLoadMoreMatches);
 
-        tvHeader.setText("TV Results for \"" + query + "\"");
-        rvPicker.setLayoutManager(new LinearLayoutManager(this));
+        tvHeader.setText("Matches for \"" + query + "\"");
+        final LinearLayoutManager llm = new LinearLayoutManager(this);
+        rvPicker.setLayoutManager(llm);
 
         final List<TvController.TvChannelMatch> matches = new ArrayList<>();
+        final TvController.TvSearchSession[] sessionHolder = new TvController.TvSearchSession[1];
         final boolean[] dismissed = new boolean[]{false};
-        final int[] extraScrollPages = new int[]{0};
+        final boolean[] playedFromDialog = new boolean[]{false};
+        final boolean[] isLoadingPage = new boolean[]{false};
 
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setView(view)
                 .setNegativeButton("Close", null)
                 .create();
 
-        dialog.setOnDismissListener(d -> dismissed[0] = true);
+        dialog.setOnDismissListener(d -> {
+            dismissed[0] = true;
+            if (!playedFromDialog[0]) {
+                dismissSearchSessionQuietly(sessionHolder[0]);
+            }
+        });
 
         final TvMatchAdapter matchAdapter = new TvMatchAdapter(
                 matches,
                 R.drawable.ic_add,
                 match -> {
-                    // Row tapped -> Play exact channel on TV immediately!
-                    playDirectMatch(match, linkToItem);
+                    playedFromDialog[0] = true;
+                    playSearchMatch(match, sessionHolder[0], linkToItem);
                     dialog.dismiss();
                 },
                 match -> {
-                    // + icon tapped -> Save exact channel permanently to home grid!
                     if (linkToItem != null) {
                         channelStore.saveDirectChannelId(linkToItem.id, match.directId);
                         Toast.makeText(MainActivity.this,
                                 "Locked " + linkToItem.title + " -> " + match.displayTitle,
                                 Toast.LENGTH_SHORT).show();
                     } else {
-                        channelStore.addCustomChannel(match.displayTitle, query, "Custom",
+                        channelStore.addCustomChannel(match.displayTitle, match.displayTitle, "Custom",
                                 SWATCH_COLORS[0], match.directId);
                         reloadChannelData();
+                        renderCategoryBar();
                         filterChannels();
                         adapter.notifyDataSetChanged();
                         Toast.makeText(MainActivity.this,
-                                "Saved " + match.displayTitle + " to channels!",
+                                "Saved " + match.displayTitle,
                                 Toast.LENGTH_SHORT).show();
                     }
                 }
         );
         rvPicker.setAdapter(matchAdapter);
 
-        final Runnable runSearch = new Runnable() {
-            @Override
-            public void run() {
-                final int mySearchGen = searchGeneration.incrementAndGet();
-                pbPicker.setVisibility(View.VISIBLE);
-                btnLoadMore.setVisibility(View.GONE);
-                tvPickerStatus.setText("Searching OTT Navigator on TV...");
-
-                searchExecutor.execute(() -> {
-                    TvController.CancelCheck cancelCheck = () ->
-                            dismissed[0] || searchGeneration.get() != mySearchGen || isUiGone();
-                    String ip = ensureTvIpFast();
-                    if (ip == null) {
-                        runOnUiThread(() -> {
-                            if (cancelCheck.isCancelled()) return;
-                            pbPicker.setVisibility(View.GONE);
-                            tvPickerStatus.setText("TV not reachable on Wi-Fi");
-                        });
-                        return;
-                    }
-
-                    TvController.SearchResult res = TvController.searchTvChannels(
-                            adbClient, ip, query, extraScrollPages[0], cancelCheck);
-
-                    if (res.connectionError && !cancelCheck.isCancelled()) {
-                        String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
-                        if (newIp != null && !cancelCheck.isCancelled()) {
-                            currentTvIp = newIp;
-                            saveTvIp(newIp);
-                            res = TvController.searchTvChannels(
-                                    adbClient, newIp, query, extraScrollPages[0], cancelCheck);
-                        }
-                    }
-
-                    if (res.cancelled || cancelCheck.isCancelled()) return;
-                    final TvController.SearchResult finalRes = res;
-
-                    runOnUiThread(() -> {
-                        if (cancelCheck.isCancelled()) return;
-                        pbPicker.setVisibility(View.GONE);
-                        if (!finalRes.success) {
-                            tvPickerStatus.setText(finalRes.errorMessage != null ? finalRes.errorMessage : "Search failed");
-                            return;
-                        }
-                        matches.clear();
-                        matches.addAll(finalRes.matches);
-                        matchAdapter.notifyDataSetChanged();
-                        if (matches.isEmpty()) {
-                            tvPickerStatus.setText("No channels found matching \"" + query + "\"");
-                        } else {
-                            tvPickerStatus.setText("Showing " + matches.size() + " TV channels — tap any to play");
-                            btnLoadMore.setVisibility(finalRes.hasMore ? View.VISIBLE : View.GONE);
-                        }
-                    });
-                });
+        // If user cached an M3U URL locally, return ALL matches instantaneously with zero TV interruption!
+        if (M3uIndex.hasCachedPlaylist(this)) {
+            List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(this, query, 250);
+            if (!localMatches.isEmpty()) {
+                pbPicker.setVisibility(View.GONE);
+                matches.addAll(localMatches);
+                matchAdapter.notifyDataSetChanged();
+                tvPickerStatus.setText("Found " + matches.size() + " channels in M3U — tap any to play");
+                dialog.show();
+                return;
             }
+        }
+
+        final Runnable loadNextPage = () -> {
+            final TvController.TvSearchSession session = sessionHolder[0];
+            if (session == null || !session.hasMore || isLoadingPage[0] || dismissed[0]) return;
+            isLoadingPage[0] = true;
+            final int myGen = tvOpGeneration.incrementAndGet();
+            pbPicker.setVisibility(View.VISIBLE);
+            btnLoadMore.setVisibility(View.GONE);
+            tvPickerStatus.setText("Loading more channels...");
+
+            tvScreenExecutor.execute(() -> {
+                TvController.CancelCheck cancelCheck = () ->
+                        dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
+                String ip = ensureTvIpFast();
+                if (ip == null) {
+                    runOnUiThread(() -> {
+                        isLoadingPage[0] = false;
+                        if (!cancelCheck.isCancelled()) pbPicker.setVisibility(View.GONE);
+                    });
+                    return;
+                }
+                TvController.SearchPageResult pageRes = TvController.scrollTvSearchNextPage(
+                        adbClient, ip, session, cancelCheck);
+                if (pageRes.cancelled || cancelCheck.isCancelled()) return;
+
+                runOnUiThread(() -> {
+                    isLoadingPage[0] = false;
+                    if (cancelCheck.isCancelled()) return;
+                    pbPicker.setVisibility(View.GONE);
+                    matches.clear();
+                    matches.addAll(session.matches);
+                    matchAdapter.notifyDataSetChanged();
+                    tvPickerStatus.setText("Showing " + matches.size() + " channels"
+                            + (session.hasMore ? " — scroll for more" : " (all loaded)"));
+                    btnLoadMore.setVisibility(session.hasMore ? View.VISIBLE : View.GONE);
+                });
+            });
         };
 
-        btnLoadMore.setOnClickListener(v -> {
-            extraScrollPages[0] += 2;
-            runSearch.run();
+        btnLoadMore.setOnClickListener(v -> loadNextPage.run());
+        rvPicker.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
+                if (dy > 0 && sessionHolder[0] != null && sessionHolder[0].hasMore && !isLoadingPage[0]) {
+                    int lastVisible = llm.findLastVisibleItemPosition();
+                    if (lastVisible >= matches.size() - 2) {
+                        loadNextPage.run();
+                    }
+                }
+            }
+        });
+
+        // Initial page search
+        final int initGen = tvOpGeneration.incrementAndGet();
+        isLoadingPage[0] = true;
+        pbPicker.setVisibility(View.VISIBLE);
+        tvPickerStatus.setText("Searching OTT Navigator on TV...");
+
+        tvScreenExecutor.execute(() -> {
+            TvController.CancelCheck cancelCheck = () ->
+                    dismissed[0] || tvOpGeneration.get() != initGen || isUiGone();
+            String ip = ensureTvIpFast();
+            if (ip == null) {
+                runOnUiThread(() -> {
+                    isLoadingPage[0] = false;
+                    if (cancelCheck.isCancelled()) return;
+                    pbPicker.setVisibility(View.GONE);
+                    tvPickerStatus.setText("TV not reachable on Wi-Fi");
+                });
+                return;
+            }
+            TvController.SearchPageResult res = TvController.openTvSearchSession(
+                    adbClient, ip, query, cancelCheck);
+            if (res.connectionError && !cancelCheck.isCancelled()) {
+                String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
+                if (newIp != null && !cancelCheck.isCancelled()) {
+                    currentTvIp = newIp;
+                    saveTvIp(newIp);
+                    res = TvController.openTvSearchSession(adbClient, newIp, query, cancelCheck);
+                }
+            }
+            if (res.cancelled || cancelCheck.isCancelled()) return;
+            final TvController.SearchPageResult finalRes = res;
+
+            runOnUiThread(() -> {
+                isLoadingPage[0] = false;
+                if (cancelCheck.isCancelled()) return;
+                pbPicker.setVisibility(View.GONE);
+                if (!finalRes.success) {
+                    tvPickerStatus.setText(finalRes.errorMessage != null ? finalRes.errorMessage : "Search failed");
+                    return;
+                }
+                sessionHolder[0] = finalRes.session;
+                matches.clear();
+                matches.addAll(finalRes.session.matches);
+                matchAdapter.notifyDataSetChanged();
+                if (matches.isEmpty()) {
+                    tvPickerStatus.setText("No channels found for \"" + query + "\"");
+                } else {
+                    tvPickerStatus.setText("Showing " + matches.size() + " channels"
+                            + (finalRes.session.hasMore ? " — scroll for more" : ""));
+                    btnLoadMore.setVisibility(finalRes.session.hasMore ? View.VISIBLE : View.GONE);
+                }
+            });
         });
 
         dialog.show();
-        runSearch.run();
     }
 
     private void showAddOrEditChannelDialog(final ChannelItem existing) {
@@ -1199,11 +1278,12 @@ public class MainActivity extends AppCompatActivity {
         TextView tvTitle = view.findViewById(R.id.tvDialogTitle);
         EditText etName = view.findViewById(R.id.etChannelName);
         EditText etSearchName = view.findViewById(R.id.etSearchName);
-        TextView btnFindOnTv = view.findViewById(R.id.btnFindOnTv);
+        TextView btnFind = view.findViewById(R.id.btnFindOnTv);
         View statusRow = view.findViewById(R.id.searchPickerStatusRow);
         ProgressBar pbDialog = view.findViewById(R.id.pbDialogSearch);
         TextView tvPickerStatus = view.findViewById(R.id.tvSearchPickerStatus);
         RecyclerView rvMatches = view.findViewById(R.id.rvDialogMatches);
+        TextView btnDialogLoadMore = view.findViewById(R.id.btnDialogLoadMore);
         TextView tvSelectedDirect = view.findViewById(R.id.tvSelectedDirectFeed);
         LinearLayout catRow = view.findViewById(R.id.dialogCategoryRow);
         LinearLayout colorRow = view.findViewById(R.id.dialogColorRow);
@@ -1234,7 +1314,7 @@ public class MainActivity extends AppCompatActivity {
             chip.setTextSize(12f);
             chip.setTypeface(chip.getTypeface(), android.graphics.Typeface.BOLD);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(34));
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(32));
             lp.setMargins(0, 0, dp(8), 0);
             chip.setLayoutParams(lp);
             chip.setGravity(Gravity.CENTER);
@@ -1253,7 +1333,7 @@ public class MainActivity extends AppCompatActivity {
 
         for (final int color : SWATCH_COLORS) {
             View swatch = new View(this);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(34), dp(34));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(32), dp(32));
             lp.setMargins(0, 0, dp(12), 0);
             swatch.setLayoutParams(lp);
             swatch.setOnClickListener(v -> {
@@ -1266,9 +1346,13 @@ public class MainActivity extends AppCompatActivity {
         updateDialogSwatches(swatchViews, chosenColor[0]);
 
         final List<TvController.TvChannelMatch> matches = new ArrayList<>();
+        final TvController.TvSearchSession[] sessionHolder = new TvController.TvSearchSession[1];
         final boolean[] dismissed = new boolean[]{false};
+        final boolean[] previewPlayed = new boolean[]{false};
+        final boolean[] isLoadingPage = new boolean[]{false};
 
-        rvMatches.setLayoutManager(new LinearLayoutManager(this));
+        final LinearLayoutManager llm = new LinearLayoutManager(this);
+        rvMatches.setLayoutManager(llm);
         final TvMatchAdapter[] matchAdapterHolder = new TvMatchAdapter[1];
         matchAdapterHolder[0] = new TvMatchAdapter(
                 matches,
@@ -1285,35 +1369,105 @@ public class MainActivity extends AppCompatActivity {
                     selectedDirectId[0] = match.directId;
                     etName.setText(match.displayTitle);
                     tvSelectedDirect.setVisibility(View.VISIBLE);
-                    tvSelectedDirect.setText("Selected & previewing: " + match.displayTitle);
+                    tvSelectedDirect.setText("Playing preview: " + match.displayTitle);
                     matchAdapterHolder[0].setSelectedDirectId(match.directId);
-                    playDirectMatch(match, null);
+                    previewPlayed[0] = true;
+                    playSearchMatch(match, sessionHolder[0], null);
                 }
         );
         rvMatches.setAdapter(matchAdapterHolder[0]);
 
-        final Runnable triggerFindOnTv = () -> {
-            if (adbClient == null) return;
-            String q = etSearchName.getText().toString().trim();
-            if (q.isEmpty()) q = etName.getText().toString().trim();
-            if (q.isEmpty()) {
-                etName.setError("Type a channel name first (e.g. Disney)");
-                return;
-            }
-            hideKeyboardFromView(etName);
-            final String finalQuery = q;
-            final int mySearchGen = searchGeneration.incrementAndGet();
-
-            statusRow.setVisibility(View.VISIBLE);
+        final Runnable loadNextDialogPage = () -> {
+            final TvController.TvSearchSession session = sessionHolder[0];
+            if (session == null || !session.hasMore || isLoadingPage[0] || dismissed[0]) return;
+            isLoadingPage[0] = true;
+            final int myGen = tvOpGeneration.incrementAndGet();
             pbDialog.setVisibility(View.VISIBLE);
-            tvPickerStatus.setText("Searching OTT Navigator for \"" + finalQuery + "\"...");
+            btnDialogLoadMore.setVisibility(View.GONE);
+            tvPickerStatus.setText("Loading more channels...");
 
-            searchExecutor.execute(() -> {
+            tvScreenExecutor.execute(() -> {
                 TvController.CancelCheck cancelCheck = () ->
-                        dismissed[0] || searchGeneration.get() != mySearchGen || isUiGone();
+                        dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
                 String ip = ensureTvIpFast();
                 if (ip == null) {
                     runOnUiThread(() -> {
+                        isLoadingPage[0] = false;
+                        if (!cancelCheck.isCancelled()) pbDialog.setVisibility(View.GONE);
+                    });
+                    return;
+                }
+                TvController.SearchPageResult pageRes = TvController.scrollTvSearchNextPage(
+                        adbClient, ip, session, cancelCheck);
+                if (pageRes.cancelled || cancelCheck.isCancelled()) return;
+
+                runOnUiThread(() -> {
+                    isLoadingPage[0] = false;
+                    if (cancelCheck.isCancelled()) return;
+                    pbDialog.setVisibility(View.GONE);
+                    matches.clear();
+                    matches.addAll(session.matches);
+                    matchAdapterHolder[0].notifyDataSetChanged();
+                    tvPickerStatus.setText("Showing " + matches.size() + " channels — tap to select, ▶ to play");
+                    btnDialogLoadMore.setVisibility(session.hasMore ? View.VISIBLE : View.GONE);
+                });
+            });
+        };
+
+        btnDialogLoadMore.setOnClickListener(v -> loadNextDialogPage.run());
+        rvMatches.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrolled(@NonNull RecyclerView recyclerView, int dx, int dy) {
+                if (dy > 0 && sessionHolder[0] != null && sessionHolder[0].hasMore && !isLoadingPage[0]) {
+                    int lastVisible = llm.findLastVisibleItemPosition();
+                    if (lastVisible >= matches.size() - 2) {
+                        loadNextDialogPage.run();
+                    }
+                }
+            }
+        });
+
+        final Runnable triggerFind = () -> {
+            String q = etSearchName.getText().toString().trim();
+            if (q.isEmpty()) q = etName.getText().toString().trim();
+            if (q.isEmpty()) {
+                etName.setError("Type a channel name first");
+                return;
+            }
+            hideKeyboardFromView(etName);
+
+            // Fast local M3U cache search if user configured an M3U URL (0ms, zero TV interruption!)
+            if (M3uIndex.hasCachedPlaylist(MainActivity.this)) {
+                List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(MainActivity.this, q, 250);
+                if (!localMatches.isEmpty()) {
+                    statusRow.setVisibility(View.VISIBLE);
+                    pbDialog.setVisibility(View.GONE);
+                    btnDialogLoadMore.setVisibility(View.GONE);
+                    matches.clear();
+                    matches.addAll(localMatches);
+                    matchAdapterHolder[0].notifyDataSetChanged();
+                    rvMatches.setVisibility(View.VISIBLE);
+                    tvPickerStatus.setText("Found " + matches.size() + " channels (instant M3U) — tap to select");
+                    return;
+                }
+            }
+
+            if (adbClient == null) return;
+            final String finalQuery = q;
+            final int myGen = tvOpGeneration.incrementAndGet();
+            isLoadingPage[0] = true;
+            statusRow.setVisibility(View.VISIBLE);
+            pbDialog.setVisibility(View.VISIBLE);
+            btnDialogLoadMore.setVisibility(View.GONE);
+            tvPickerStatus.setText("Searching OTT Navigator for \"" + finalQuery + "\"...");
+
+            tvScreenExecutor.execute(() -> {
+                TvController.CancelCheck cancelCheck = () ->
+                        dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
+                String ip = ensureTvIpFast();
+                if (ip == null) {
+                    runOnUiThread(() -> {
+                        isLoadingPage[0] = false;
                         if (cancelCheck.isCancelled()) return;
                         pbDialog.setVisibility(View.GONE);
                         tvPickerStatus.setText("TV offline on Wi-Fi");
@@ -1321,45 +1475,47 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                TvController.SearchResult res = TvController.searchTvChannels(
-                        adbClient, ip, finalQuery, 0, cancelCheck);
+                TvController.SearchPageResult res = TvController.openTvSearchSession(
+                        adbClient, ip, finalQuery, cancelCheck);
                 if (res.connectionError && !cancelCheck.isCancelled()) {
                     String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
                     if (newIp != null && !cancelCheck.isCancelled()) {
                         currentTvIp = newIp;
                         saveTvIp(newIp);
-                        res = TvController.searchTvChannels(
-                                adbClient, newIp, finalQuery, 0, cancelCheck);
+                        res = TvController.openTvSearchSession(adbClient, newIp, finalQuery, cancelCheck);
                     }
                 }
                 if (res.cancelled || cancelCheck.isCancelled()) return;
-                final TvController.SearchResult finalRes = res;
+                final TvController.SearchPageResult finalRes = res;
 
                 runOnUiThread(() -> {
+                    isLoadingPage[0] = false;
                     if (cancelCheck.isCancelled()) return;
                     pbDialog.setVisibility(View.GONE);
                     if (!finalRes.success) {
                         tvPickerStatus.setText(finalRes.errorMessage != null ? finalRes.errorMessage : "Search failed");
                         return;
                     }
+                    sessionHolder[0] = finalRes.session;
                     matches.clear();
-                    matches.addAll(finalRes.matches);
+                    matches.addAll(finalRes.session.matches);
                     matchAdapterHolder[0].notifyDataSetChanged();
                     if (matches.isEmpty()) {
                         rvMatches.setVisibility(View.GONE);
-                        tvPickerStatus.setText("No TV matches for \"" + finalQuery + "\"");
+                        tvPickerStatus.setText("No matches for \"" + finalQuery + "\"");
                     } else {
                         rvMatches.setVisibility(View.VISIBLE);
-                        tvPickerStatus.setText("Found " + matches.size() + " channels — tap to select, or ▶ to test");
+                        tvPickerStatus.setText("Showing " + matches.size() + " channels — tap to select, ▶ to play");
+                        btnDialogLoadMore.setVisibility(finalRes.session.hasMore ? View.VISIBLE : View.GONE);
                     }
                 });
             });
         };
 
-        btnFindOnTv.setOnClickListener(v -> triggerFindOnTv.run());
+        btnFind.setOnClickListener(v -> triggerFind.run());
         etName.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                triggerFindOnTv.run();
+                triggerFind.run();
                 return true;
             }
             return false;
@@ -1371,7 +1527,12 @@ public class MainActivity extends AppCompatActivity {
                 .setNegativeButton("Cancel", null)
                 .create();
 
-        dialog.setOnDismissListener(d -> dismissed[0] = true);
+        dialog.setOnDismissListener(d -> {
+            dismissed[0] = true;
+            if (!previewPlayed[0]) {
+                dismissSearchSessionQuietly(sessionHolder[0]);
+            }
+        });
 
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             String name = etName.getText().toString().trim();
@@ -1393,8 +1554,7 @@ public class MainActivity extends AppCompatActivity {
                 Toast.makeText(this, "Updated " + name, Toast.LENGTH_SHORT).show();
             }
             reloadChannelData();
-            updateCategoryStyles();
-            renderRecentStrip();
+            renderCategoryBar();
             filterChannels();
             adapter.notifyDataSetChanged();
             channelRecycler.scrollToPosition(0);
@@ -1455,7 +1615,7 @@ public class MainActivity extends AppCompatActivity {
                     } else if ("Delete Channel".equals(action)) {
                         channelStore.deleteCustomChannel(item.id);
                         reloadChannelData();
-                        renderRecentStrip();
+                        renderCategoryBar();
                         filterChannels();
                         adapter.notifyDataSetChanged();
                         Toast.makeText(this, "Removed " + item.title, Toast.LENGTH_SHORT).show();
@@ -1510,9 +1670,9 @@ public class MainActivity extends AppCompatActivity {
             Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
             if (v == null) return;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                v.vibrate(VibrationEffect.createOneShot(22, VibrationEffect.DEFAULT_AMPLITUDE));
+                v.vibrate(VibrationEffect.createOneShot(20, VibrationEffect.DEFAULT_AMPLITUDE));
             } else {
-                v.vibrate(22);
+                v.vibrate(20);
             }
         } catch (Exception ignored) {
         }
@@ -1537,9 +1697,8 @@ public class MainActivity extends AppCompatActivity {
         }
         mainHandler.removeCallbacksAndMessages(null);
         connectExecutor.shutdownNow();
-        channelExecutor.shutdownNow();
+        tvScreenExecutor.shutdownNow();
         remoteExecutor.shutdownNow();
-        searchExecutor.shutdownNow();
         if (adbClient != null) {
             adbClient.close();
         }
@@ -1666,7 +1825,7 @@ public class MainActivity extends AppCompatActivity {
                 holder.ivPlayDot.setVisibility(View.VISIBLE);
             } else {
                 holder.tvCategory.setText(item.isCustom ? "Custom • " + item.category : item.category);
-                holder.tvCategory.setTextColor(ContextCompat.getColor(MainActivity.this, R.color.text_secondary));
+                holder.tvCategory.setTextColor(ContextCompat.getColor(MainActivity.this, R.color.text_muted));
                 holder.ivPlayDot.setVisibility(View.GONE);
             }
 

@@ -19,14 +19,14 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="Tap any result to play on TV immediately, or tap + to save as a card."
+        android:text="Scroll all matches below. Tap any row to play, or + to save."
         android:textColor="@color/text_secondary"
         android:textSize="12sp" />
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="10dp"
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
@@ -42,7 +42,7 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Fetching matching channels from TV..."
+            android:text="Fetching channels..."
             android:textColor="@color/accent_gold_bright"
             android:textSize="12sp"
             android:textStyle="bold" />
@@ -51,7 +51,7 @@
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvPickerMatches"
         android:layout_width="match_parent"
-        android:layout_height="270dp"
+        android:layout_height="300dp"
         android:layout_marginTop="10dp" />
 
     <TextView
@@ -63,7 +63,7 @@
         android:clickable="true"
         android:focusable="true"
         android:gravity="center"
-        android:text="Load More Results from TV"
+        android:text="Load More Results"
         android:textColor="@color/accent_gold_bright"
         android:textSize="12sp"
         android:textStyle="bold"

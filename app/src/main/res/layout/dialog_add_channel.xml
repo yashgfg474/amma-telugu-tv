@@ -23,7 +23,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Type a name (e.g. Disney) and tap Find on TV to pick the exact feed."
+            android:text="Search any M3U playlist channel, scroll all results, and pick the exact feed."
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 
@@ -50,11 +50,11 @@
                 android:layout_marginEnd="8dp"
                 android:layout_weight="1"
                 android:background="@drawable/bg_search_pill"
-                android:hint="e.g. Disney or Zee Telugu"
+                android:hint="e.g. Hungama or Disney"
                 android:imeOptions="actionSearch"
                 android:inputType="textCapWords"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
                 android:singleLine="true"
                 android:textColor="@color/text_primary"
                 android:textColorHint="@color/text_muted"
@@ -68,15 +68,15 @@
                 android:clickable="true"
                 android:focusable="true"
                 android:gravity="center"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:text="Find on TV"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="Find"
                 android:textColor="@color/text_on_gold"
-                android:textSize="12sp"
+                android:textSize="13sp"
                 android:textStyle="bold" />
         </LinearLayout>
 
-        <!-- Inline Live TV Search Results -->
+        <!-- Inline Live Search Results -->
         <LinearLayout
             android:id="@+id/searchPickerStatusRow"
             android:layout_width="match_parent"
@@ -98,7 +98,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Searching OTT Navigator..."
+                android:text="Searching..."
                 android:textColor="@color/accent_gold_bright"
                 android:textSize="12sp"
                 android:textStyle="bold" />
@@ -107,8 +107,23 @@
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/rvDialogMatches"
             android:layout_width="match_parent"
-            android:layout_height="185dp"
+            android:layout_height="205dp"
             android:layout_marginTop="8dp"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/btnDialogLoadMore"
+            android:layout_width="match_parent"
+            android:layout_height="34dp"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_chip_inactive"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="Load More Channels"
+            android:textColor="@color/accent_gold_bright"
+            android:textSize="12sp"
+            android:textStyle="bold"
             android:visibility="gone" />
 
         <TextView
@@ -136,11 +151,11 @@
             android:layout_height="44dp"
             android:layout_marginTop="6dp"
             android:background="@drawable/bg_search_pill"
-            android:hint="Leave blank to search by Channel Name"
+            android:hint="Leave blank to use Channel Name"
             android:imeOptions="actionDone"
             android:inputType="text"
-            android:paddingStart="12dp"
-            android:paddingEnd="12dp"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
             android:singleLine="true"
             android:textColor="@color/text_primary"
             android:textColorHint="@color/text_muted"

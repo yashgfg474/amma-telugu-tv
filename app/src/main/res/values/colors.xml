@@ -3,19 +3,19 @@
     <color name="ic_launcher_background">#141F33</color>
 
     <!-- Rich Dark Slate Palette -->
-    <color name="bg_canvas">#0B0F19</color>
+    <color name="bg_canvas">#0A0E17</color>
     <color name="bg_surface">#131A29</color>
-    <color name="bg_surface_elevated">#1C263B</color>
-    <color name="bg_surface_pressed">#25324D</color>
-    <color name="border_subtle">#26324A</color>
+    <color name="bg_surface_elevated">#1B2438</color>
+    <color name="bg_surface_pressed">#24304A</color>
+    <color name="border_subtle">#222E46</color>
 
     <!-- Royal Gold & Crimson Accents -->
     <color name="accent_gold">#F59E0B</color>
     <color name="accent_gold_bright">#FBBF24</color>
-    <color name="accent_gold_soft">#2D2312</color>
+    <color name="accent_gold_soft">#282012</color>
     <color name="accent_crimson">#E11D48</color>
-    <color name="accent_crimson_soft">#301220</color>
-    <color name="text_on_gold">#0B0F19</color>
+    <color name="accent_crimson_soft">#2D1220</color>
+    <color name="text_on_gold">#0A0E17</color>
 
     <!-- Status Indicators -->
     <color name="status_green">#22C55E</color>

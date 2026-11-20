@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">TeluCast</string>
-    <string name="search_hint">Search channels (e.g. Zee Telugu, Star Maa, ETV)...</string>
+    <string name="search_hint">Search channels or tap TV to find...</string>
     <string name="status_scanning">Finding TV on Wi-Fi...</string>
     <string name="tab_channels">Channels</string>
     <string name="tab_remote">TV Remote</string>
     <string name="add_channel">Add</string>
-    <string name="empty_channels_title">No channels found</string>
-    <string name="empty_channels_subtitle">Try another search or tap + Add to create a custom channel.</string>
+    <string name="empty_channels_title">No matching channels</string>
+    <string name="empty_channels_subtitle">Tap TV inside the search bar to search all OTT Navigator playlists live.</string>
 </resources>
