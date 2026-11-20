@@ -2,6 +2,7 @@ package com.yash.ammatv;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.graphics.drawable.Drawable;
@@ -11,6 +12,7 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -45,6 +47,7 @@ import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -59,6 +62,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS_NAME = "amma_tv_prefs";
     private static final String KEY_TV_IP = "tv_ip";
+    private static final int REQ_PICK_M3U = 4102;
     private static final int VOLUME_STEP = 5;
     private static final int VOLUME_HOLD_STEP = 3;
     private static final int VOLUME_DEBOUNCE_MS = 100;
@@ -283,6 +287,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupSearch() {
+        updateSearchButtonLabel();
+
         etSearch.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -323,6 +329,53 @@ public class MainActivity extends AppCompatActivity {
                 showTvSearchPickerDialog(currentSearchText, null);
             }
         });
+    }
+
+    private void updateSearchButtonLabel() {
+        if (btnSearchTvInline != null) {
+            btnSearchTvInline.setText(M3uIndex.hasCachedPlaylist(this) ? "Search M3U" : "Find on TV");
+        }
+    }
+
+    private void launchM3uFilePicker() {
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            startActivityForResult(intent, REQ_PICK_M3U);
+        } catch (Exception e) {
+            Toast.makeText(this, "No file picker available on this device", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_PICK_M3U && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            final Uri uri = data.getData();
+            Toast.makeText(this, "Importing playlist...", Toast.LENGTH_SHORT).show();
+            connectExecutor.execute(() -> {
+                try (InputStream is = getContentResolver().openInputStream(uri)) {
+                    int cnt = M3uIndex.importFromStream(MainActivity.this, is, "Imported M3U File");
+                    runOnUiThread(() -> {
+                        if (!isUiGone()) {
+                            updateSearchButtonLabel();
+                            Toast.makeText(MainActivity.this,
+                                    "Imported " + cnt + " channels for instant silent search!",
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> {
+                        if (!isUiGone()) {
+                            Toast.makeText(MainActivity.this,
+                                    "M3U import failed: " + e.getMessage(),
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    });
+                }
+            });
+        }
     }
 
     private void setupTabs() {
@@ -1036,17 +1089,28 @@ public class MainActivity extends AppCompatActivity {
         View view = LayoutInflater.from(this).inflate(R.layout.dialog_tv_settings, null);
         EditText etIp = view.findViewById(R.id.etSettingsTvIp);
         EditText etM3u = view.findViewById(R.id.etSettingsM3uUrl);
+        TextView btnImportFile = view.findViewById(R.id.btnImportM3uFile);
         TextView tvM3uStatus = view.findViewById(R.id.tvM3uStatus);
 
         etIp.setText(currentTvIp);
         etM3u.setText(M3uIndex.getSavedUrl(this));
-        if (M3uIndex.hasCachedPlaylist(this)) {
-            int count = M3uIndex.searchCached(this, "", 10000).size();
+
+        int cachedCnt = M3uIndex.getCachedChannelCount(this);
+        int learnedCnt = M3uIndex.getLearnedChannelCount(this);
+        if (cachedCnt > 0 || learnedCnt > 0) {
             tvM3uStatus.setVisibility(View.VISIBLE);
-            tvM3uStatus.setText("Cached " + count + " channels locally (0ms silent phone search active)");
+            StringBuilder st = new StringBuilder();
+            if (cachedCnt > 0) {
+                st.append("M3U Playlist: ").append(cachedCnt).append(" channels (0ms silent search active)");
+            }
+            if (learnedCnt > 0) {
+                if (st.length() > 0) st.append("\n");
+                st.append("Auto-cached from TV searches: ").append(learnedCnt).append(" channels");
+            }
+            tvM3uStatus.setText(st.toString());
         }
 
-        new AlertDialog.Builder(this)
+        final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setView(view)
                 .setPositiveButton("Save", (d, w) -> {
                     String enteredIp = etIp.getText().toString().trim();
@@ -1059,16 +1123,19 @@ public class MainActivity extends AppCompatActivity {
 
                     String oldM3u = M3uIndex.getSavedUrl(this);
                     if (enteredM3u.isEmpty()) {
-                        M3uIndex.saveUrl(this, "");
-                    } else if (!enteredM3u.equals(oldM3u) || !M3uIndex.hasCachedPlaylist(this)) {
+                        M3uIndex.clearPlaylist(this);
+                        updateSearchButtonLabel();
+                    } else if ((enteredM3u.startsWith("http://") || enteredM3u.startsWith("https://"))
+                            && (!enteredM3u.equals(oldM3u) || !M3uIndex.hasCachedPlaylist(this))) {
                         Toast.makeText(this, "Syncing M3U playlist...", Toast.LENGTH_SHORT).show();
                         connectExecutor.execute(() -> {
                             try {
                                 int cnt = M3uIndex.refreshFromUrl(MainActivity.this, enteredM3u);
                                 runOnUiThread(() -> {
                                     if (!isUiGone()) {
+                                        updateSearchButtonLabel();
                                         Toast.makeText(MainActivity.this,
-                                                "Synced " + cnt + " channels for instant search!",
+                                                "Synced " + cnt + " channels for instant silent search!",
                                                 Toast.LENGTH_LONG).show();
                                     }
                                 });
@@ -1082,6 +1149,10 @@ public class MainActivity extends AppCompatActivity {
                                 });
                             }
                         });
+                    } else if (!enteredM3u.equals(oldM3u) && !"Imported M3U File".equals(enteredM3u)) {
+                        Toast.makeText(this,
+                                "Enter an http:// or https:// M3U URL, or tap Import File",
+                                Toast.LENGTH_LONG).show();
                     }
                 })
                 .setNeutralButton("Auto Scan TV", (d, w) -> {
@@ -1089,7 +1160,48 @@ public class MainActivity extends AppCompatActivity {
                     autoConnectTv(true);
                 })
                 .setNegativeButton("Cancel", null)
-                .show();
+                .create();
+
+        btnImportFile.setOnClickListener(v -> {
+            dialog.dismiss();
+            launchM3uFilePicker();
+        });
+
+        dialog.show();
+    }
+
+    private TvController.SearchPageResult openSearchWithReconnect(String query, TvController.CancelCheck cancelCheck) {
+        String ip = ensureTvIpFast();
+        if (ip == null) {
+            return new TvController.SearchPageResult(false, false, true, "TV not reachable on Wi-Fi",
+                    new TvController.TvSearchSession(query), 0);
+        }
+        TvController.SearchPageResult res = TvController.openTvSearchSession(adbClient, ip, query, cancelCheck);
+        if (res.connectionError && !cancelCheck.isCancelled()) {
+            String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
+            if (newIp != null && !cancelCheck.isCancelled()) {
+                currentTvIp = newIp;
+                saveTvIp(newIp);
+                res = TvController.openTvSearchSession(adbClient, newIp, query, cancelCheck);
+            }
+        }
+        if (res.success && res.session != null && !res.session.matches.isEmpty()) {
+            M3uIndex.recordLearnedMatches(MainActivity.this, res.session.matches);
+        }
+        return res;
+    }
+
+    private TvController.SearchPageResult scrollSearchNextPageAndLearn(
+            TvController.TvSearchSession session, TvController.CancelCheck cancelCheck) {
+        String ip = ensureTvIpFast();
+        if (ip == null) {
+            return new TvController.SearchPageResult(false, false, true, "TV not reachable on Wi-Fi", session, 0);
+        }
+        TvController.SearchPageResult res = TvController.scrollTvSearchNextPage(adbClient, ip, session, cancelCheck);
+        if (res.success && res.session != null && !res.session.matches.isEmpty()) {
+            M3uIndex.recordLearnedMatches(MainActivity.this, res.session.matches);
+        }
+        return res;
     }
 
     private void showTvSearchPickerDialog(final String query, final ChannelItem linkToItem) {
@@ -1100,6 +1212,8 @@ public class MainActivity extends AppCompatActivity {
         TextView tvPickerStatus = view.findViewById(R.id.tvPickerStatus);
         RecyclerView rvPicker = view.findViewById(R.id.rvPickerMatches);
         TextView btnLoadMore = view.findViewById(R.id.btnLoadMoreMatches);
+        TextView btnSearchLiveTv = view.findViewById(R.id.btnSearchLiveTv);
+        TextView btnSetupSilentM3u = view.findViewById(R.id.btnSetupSilentM3u);
 
         tvHeader.setText("Matches for \"" + query + "\"");
         final LinearLayoutManager llm = new LinearLayoutManager(this);
@@ -1138,7 +1252,8 @@ public class MainActivity extends AppCompatActivity {
                                 "Locked " + linkToItem.title + " -> " + match.displayTitle,
                                 Toast.LENGTH_SHORT).show();
                     } else {
-                        channelStore.addCustomChannel(match.displayTitle, match.displayTitle, "Custom",
+                        String cleanKw = TvController.extractSearchKeyword(match.rawTitle, match.displayTitle);
+                        channelStore.addCustomChannel(match.displayTitle, cleanKw, "Custom",
                                 SWATCH_COLORS[0], match.directId);
                         reloadChannelData();
                         renderCategoryBar();
@@ -1152,18 +1267,10 @@ public class MainActivity extends AppCompatActivity {
         );
         rvPicker.setAdapter(matchAdapter);
 
-        // If user cached an M3U URL locally, return ALL matches instantaneously with zero TV interruption!
-        if (M3uIndex.hasCachedPlaylist(this)) {
-            List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(this, query, 250);
-            if (!localMatches.isEmpty()) {
-                pbPicker.setVisibility(View.GONE);
-                matches.addAll(localMatches);
-                matchAdapter.notifyDataSetChanged();
-                tvPickerStatus.setText("Found " + matches.size() + " channels in M3U — tap any to play");
-                dialog.show();
-                return;
-            }
-        }
+        btnSetupSilentM3u.setOnClickListener(v -> {
+            dialog.dismiss();
+            showSettingsDialog();
+        });
 
         final Runnable loadNextPage = () -> {
             final TvController.TvSearchSession session = sessionHolder[0];
@@ -1177,16 +1284,7 @@ public class MainActivity extends AppCompatActivity {
             tvScreenExecutor.execute(() -> {
                 TvController.CancelCheck cancelCheck = () ->
                         dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
-                String ip = ensureTvIpFast();
-                if (ip == null) {
-                    runOnUiThread(() -> {
-                        isLoadingPage[0] = false;
-                        if (!cancelCheck.isCancelled()) pbPicker.setVisibility(View.GONE);
-                    });
-                    return;
-                }
-                TvController.SearchPageResult pageRes = TvController.scrollTvSearchNextPage(
-                        adbClient, ip, session, cancelCheck);
+                TvController.SearchPageResult pageRes = scrollSearchNextPageAndLearn(session, cancelCheck);
                 if (pageRes.cancelled || cancelCheck.isCancelled()) return;
 
                 runOnUiThread(() -> {
@@ -1216,60 +1314,79 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        // Initial page search
-        final int initGen = tvOpGeneration.incrementAndGet();
-        isLoadingPage[0] = true;
-        pbPicker.setVisibility(View.VISIBLE);
-        tvPickerStatus.setText("Searching OTT Navigator on TV...");
+        final Runnable startLiveSearch = () -> {
+            final int initGen = tvOpGeneration.incrementAndGet();
+            isLoadingPage[0] = true;
+            pbPicker.setVisibility(View.VISIBLE);
+            btnLoadMore.setVisibility(View.GONE);
+            btnSearchLiveTv.setVisibility(View.GONE);
+            btnSetupSilentM3u.setVisibility(
+                    M3uIndex.hasCachedPlaylist(MainActivity.this) ? View.GONE : View.VISIBLE);
+            tvPickerStatus.setText("Searching OTT Navigator on TV...");
 
-        tvScreenExecutor.execute(() -> {
-            TvController.CancelCheck cancelCheck = () ->
-                    dismissed[0] || tvOpGeneration.get() != initGen || isUiGone();
-            String ip = ensureTvIpFast();
-            if (ip == null) {
+            tvScreenExecutor.execute(() -> {
+                TvController.CancelCheck cancelCheck = () ->
+                        dismissed[0] || tvOpGeneration.get() != initGen || isUiGone();
+                TvController.SearchPageResult res = openSearchWithReconnect(query, cancelCheck);
+                if (res.cancelled || cancelCheck.isCancelled()) return;
+                final TvController.SearchPageResult finalRes = res;
+
                 runOnUiThread(() -> {
                     isLoadingPage[0] = false;
                     if (cancelCheck.isCancelled()) return;
                     pbPicker.setVisibility(View.GONE);
-                    tvPickerStatus.setText("TV not reachable on Wi-Fi");
+                    if (!finalRes.success) {
+                        tvPickerStatus.setText(finalRes.errorMessage != null ? finalRes.errorMessage : "Search failed");
+                        return;
+                    }
+                    sessionHolder[0] = finalRes.session;
+                    matches.clear();
+                    matches.addAll(finalRes.session.matches);
+                    matchAdapter.notifyDataSetChanged();
+                    if (matches.isEmpty()) {
+                        tvPickerStatus.setText("No channels found for \"" + query + "\"");
+                    } else {
+                        tvPickerStatus.setText("Showing " + matches.size() + " channels"
+                                + (finalRes.session.hasMore ? " — scroll for more" : ""));
+                        btnLoadMore.setVisibility(finalRes.session.hasMore ? View.VISIBLE : View.GONE);
+                    }
                 });
+            });
+        };
+
+        btnSearchLiveTv.setOnClickListener(v -> startLiveSearch.run());
+
+        // Tier 1 (0ms, zero TV interruption): User-linked M3U URL or imported .m3u file
+        if (M3uIndex.hasCachedPlaylist(this)) {
+            List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(this, query, 250);
+            if (!localMatches.isEmpty()) {
+                pbPicker.setVisibility(View.GONE);
+                matches.addAll(localMatches);
+                matchAdapter.notifyDataSetChanged();
+                tvPickerStatus.setText("Found " + matches.size() + " in M3U (zero TV interrupt) — tap to play");
+                btnSearchLiveTv.setVisibility(View.VISIBLE);
+                dialog.show();
                 return;
             }
-            TvController.SearchPageResult res = TvController.openTvSearchSession(
-                    adbClient, ip, query, cancelCheck);
-            if (res.connectionError && !cancelCheck.isCancelled()) {
-                String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
-                if (newIp != null && !cancelCheck.isCancelled()) {
-                    currentTvIp = newIp;
-                    saveTvIp(newIp);
-                    res = TvController.openTvSearchSession(adbClient, newIp, query, cancelCheck);
-                }
+        }
+
+        // Tier 2 (0ms, zero TV interruption): Auto-learned channels from past TV searches
+        List<TvController.TvChannelMatch> learned = M3uIndex.searchLearned(this, query, 200);
+        if (!learned.isEmpty()) {
+            pbPicker.setVisibility(View.GONE);
+            matches.addAll(learned);
+            matchAdapter.notifyDataSetChanged();
+            tvPickerStatus.setText("Found " + matches.size() + " cached channels (no TV popup) — tap to play");
+            btnSearchLiveTv.setVisibility(View.VISIBLE);
+            if (!M3uIndex.hasCachedPlaylist(this)) {
+                btnSetupSilentM3u.setVisibility(View.VISIBLE);
             }
-            if (res.cancelled || cancelCheck.isCancelled()) return;
-            final TvController.SearchPageResult finalRes = res;
+            dialog.show();
+            return;
+        }
 
-            runOnUiThread(() -> {
-                isLoadingPage[0] = false;
-                if (cancelCheck.isCancelled()) return;
-                pbPicker.setVisibility(View.GONE);
-                if (!finalRes.success) {
-                    tvPickerStatus.setText(finalRes.errorMessage != null ? finalRes.errorMessage : "Search failed");
-                    return;
-                }
-                sessionHolder[0] = finalRes.session;
-                matches.clear();
-                matches.addAll(finalRes.session.matches);
-                matchAdapter.notifyDataSetChanged();
-                if (matches.isEmpty()) {
-                    tvPickerStatus.setText("No channels found for \"" + query + "\"");
-                } else {
-                    tvPickerStatus.setText("Showing " + matches.size() + " channels"
-                            + (finalRes.session.hasMore ? " — scroll for more" : ""));
-                    btnLoadMore.setVisibility(finalRes.session.hasMore ? View.VISIBLE : View.GONE);
-                }
-            });
-        });
-
+        // Tier 3: Live TV search
+        startLiveSearch.run();
         dialog.show();
     }
 
@@ -1284,6 +1401,8 @@ public class MainActivity extends AppCompatActivity {
         TextView tvPickerStatus = view.findViewById(R.id.tvSearchPickerStatus);
         RecyclerView rvMatches = view.findViewById(R.id.rvDialogMatches);
         TextView btnDialogLoadMore = view.findViewById(R.id.btnDialogLoadMore);
+        TextView btnDialogSearchLiveTv = view.findViewById(R.id.btnDialogSearchLiveTv);
+        TextView btnDialogSetupSilentM3u = view.findViewById(R.id.btnDialogSetupSilentM3u);
         TextView tvSelectedDirect = view.findViewById(R.id.tvSelectedDirectFeed);
         LinearLayout catRow = view.findViewById(R.id.dialogCategoryRow);
         LinearLayout colorRow = view.findViewById(R.id.dialogColorRow);
@@ -1361,6 +1480,8 @@ public class MainActivity extends AppCompatActivity {
                     selectedDirectId[0] = match.directId;
                     etName.setText(match.displayTitle);
                     etName.setSelection(match.displayTitle.length());
+                    String cleanKw = TvController.extractSearchKeyword(match.rawTitle, match.displayTitle);
+                    etSearchName.setText(cleanKw.equalsIgnoreCase(match.displayTitle) ? "" : cleanKw);
                     tvSelectedDirect.setVisibility(View.VISIBLE);
                     tvSelectedDirect.setText("Selected feed: " + match.displayTitle + " (" + match.groupSubtitle + ")");
                     matchAdapterHolder[0].setSelectedDirectId(match.directId);
@@ -1368,6 +1489,8 @@ public class MainActivity extends AppCompatActivity {
                 match -> {
                     selectedDirectId[0] = match.directId;
                     etName.setText(match.displayTitle);
+                    String cleanKw = TvController.extractSearchKeyword(match.rawTitle, match.displayTitle);
+                    etSearchName.setText(cleanKw.equalsIgnoreCase(match.displayTitle) ? "" : cleanKw);
                     tvSelectedDirect.setVisibility(View.VISIBLE);
                     tvSelectedDirect.setText("Playing preview: " + match.displayTitle);
                     matchAdapterHolder[0].setSelectedDirectId(match.directId);
@@ -1389,16 +1512,7 @@ public class MainActivity extends AppCompatActivity {
             tvScreenExecutor.execute(() -> {
                 TvController.CancelCheck cancelCheck = () ->
                         dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
-                String ip = ensureTvIpFast();
-                if (ip == null) {
-                    runOnUiThread(() -> {
-                        isLoadingPage[0] = false;
-                        if (!cancelCheck.isCancelled()) pbDialog.setVisibility(View.GONE);
-                    });
-                    return;
-                }
-                TvController.SearchPageResult pageRes = TvController.scrollTvSearchNextPage(
-                        adbClient, ip, session, cancelCheck);
+                TvController.SearchPageResult pageRes = scrollSearchNextPageAndLearn(session, cancelCheck);
                 if (pageRes.cancelled || cancelCheck.isCancelled()) return;
 
                 runOnUiThread(() -> {
@@ -1427,64 +1541,25 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        final Runnable triggerFind = () -> {
+        final Runnable runDialogLiveSearch = () -> {
             String q = etSearchName.getText().toString().trim();
             if (q.isEmpty()) q = etName.getText().toString().trim();
-            if (q.isEmpty()) {
-                etName.setError("Type a channel name first");
-                return;
-            }
-            hideKeyboardFromView(etName);
-
-            // Fast local M3U cache search if user configured an M3U URL (0ms, zero TV interruption!)
-            if (M3uIndex.hasCachedPlaylist(MainActivity.this)) {
-                List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(MainActivity.this, q, 250);
-                if (!localMatches.isEmpty()) {
-                    statusRow.setVisibility(View.VISIBLE);
-                    pbDialog.setVisibility(View.GONE);
-                    btnDialogLoadMore.setVisibility(View.GONE);
-                    matches.clear();
-                    matches.addAll(localMatches);
-                    matchAdapterHolder[0].notifyDataSetChanged();
-                    rvMatches.setVisibility(View.VISIBLE);
-                    tvPickerStatus.setText("Found " + matches.size() + " channels (instant M3U) — tap to select");
-                    return;
-                }
-            }
-
-            if (adbClient == null) return;
+            if (q.isEmpty() || adbClient == null) return;
             final String finalQuery = q;
             final int myGen = tvOpGeneration.incrementAndGet();
             isLoadingPage[0] = true;
             statusRow.setVisibility(View.VISIBLE);
             pbDialog.setVisibility(View.VISIBLE);
             btnDialogLoadMore.setVisibility(View.GONE);
+            btnDialogSearchLiveTv.setVisibility(View.GONE);
+            btnDialogSetupSilentM3u.setVisibility(
+                    M3uIndex.hasCachedPlaylist(MainActivity.this) ? View.GONE : View.VISIBLE);
             tvPickerStatus.setText("Searching OTT Navigator for \"" + finalQuery + "\"...");
 
             tvScreenExecutor.execute(() -> {
                 TvController.CancelCheck cancelCheck = () ->
                         dismissed[0] || tvOpGeneration.get() != myGen || isUiGone();
-                String ip = ensureTvIpFast();
-                if (ip == null) {
-                    runOnUiThread(() -> {
-                        isLoadingPage[0] = false;
-                        if (cancelCheck.isCancelled()) return;
-                        pbDialog.setVisibility(View.GONE);
-                        tvPickerStatus.setText("TV offline on Wi-Fi");
-                    });
-                    return;
-                }
-
-                TvController.SearchPageResult res = TvController.openTvSearchSession(
-                        adbClient, ip, finalQuery, cancelCheck);
-                if (res.connectionError && !cancelCheck.isCancelled()) {
-                    String newIp = TvDiscovery.findTvIp(MainActivity.this, "");
-                    if (newIp != null && !cancelCheck.isCancelled()) {
-                        currentTvIp = newIp;
-                        saveTvIp(newIp);
-                        res = TvController.openTvSearchSession(adbClient, newIp, finalQuery, cancelCheck);
-                    }
-                }
+                TvController.SearchPageResult res = openSearchWithReconnect(finalQuery, cancelCheck);
                 if (res.cancelled || cancelCheck.isCancelled()) return;
                 final TvController.SearchPageResult finalRes = res;
 
@@ -1512,6 +1587,56 @@ public class MainActivity extends AppCompatActivity {
             });
         };
 
+        btnDialogSearchLiveTv.setOnClickListener(v -> runDialogLiveSearch.run());
+
+        final Runnable triggerFind = () -> {
+            String q = etSearchName.getText().toString().trim();
+            if (q.isEmpty()) q = etName.getText().toString().trim();
+            if (q.isEmpty()) {
+                etName.setError("Type a channel name first");
+                return;
+            }
+            hideKeyboardFromView(etName);
+
+            // Tier 1 (0ms, zero TV interruption): M3U playlist cache
+            if (M3uIndex.hasCachedPlaylist(MainActivity.this)) {
+                List<TvController.TvChannelMatch> localMatches = M3uIndex.searchCached(MainActivity.this, q, 250);
+                if (!localMatches.isEmpty()) {
+                    statusRow.setVisibility(View.VISIBLE);
+                    pbDialog.setVisibility(View.GONE);
+                    btnDialogLoadMore.setVisibility(View.GONE);
+                    btnDialogSearchLiveTv.setVisibility(View.VISIBLE);
+                    btnDialogSetupSilentM3u.setVisibility(View.GONE);
+                    matches.clear();
+                    matches.addAll(localMatches);
+                    matchAdapterHolder[0].notifyDataSetChanged();
+                    rvMatches.setVisibility(View.VISIBLE);
+                    tvPickerStatus.setText("Found " + matches.size() + " in M3U (no TV popup) — tap to select");
+                    return;
+                }
+            }
+
+            // Tier 2 (0ms, zero TV interruption): Auto-learned local catalog
+            List<TvController.TvChannelMatch> learned = M3uIndex.searchLearned(MainActivity.this, q, 200);
+            if (!learned.isEmpty()) {
+                statusRow.setVisibility(View.VISIBLE);
+                pbDialog.setVisibility(View.GONE);
+                btnDialogLoadMore.setVisibility(View.GONE);
+                btnDialogSearchLiveTv.setVisibility(View.VISIBLE);
+                btnDialogSetupSilentM3u.setVisibility(
+                        M3uIndex.hasCachedPlaylist(MainActivity.this) ? View.GONE : View.VISIBLE);
+                matches.clear();
+                matches.addAll(learned);
+                matchAdapterHolder[0].notifyDataSetChanged();
+                rvMatches.setVisibility(View.VISIBLE);
+                tvPickerStatus.setText("Found " + matches.size() + " cached (no TV popup) — tap to select");
+                return;
+            }
+
+            // Tier 3: Live TV search
+            runDialogLiveSearch.run();
+        };
+
         btnFind.setOnClickListener(v -> triggerFind.run());
         etName.setOnEditorActionListener((v, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
@@ -1526,6 +1651,11 @@ public class MainActivity extends AppCompatActivity {
                 .setPositiveButton("Save", null)
                 .setNegativeButton("Cancel", null)
                 .create();
+
+        btnDialogSetupSilentM3u.setOnClickListener(v -> {
+            dialog.dismiss();
+            showSettingsDialog();
+        });
 
         dialog.setOnDismissListener(d -> {
             dismissed[0] = true;

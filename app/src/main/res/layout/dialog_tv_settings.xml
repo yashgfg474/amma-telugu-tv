@@ -54,7 +54,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="14dp"
-            android:text="Optional M3U URL (For 0ms Phone Search)"
+            android:text="Silent Phone Search (M3U URLs or File)"
             android:textColor="@color/text_secondary"
             android:textSize="12sp"
             android:textStyle="bold" />
@@ -63,24 +63,43 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="2dp"
-            android:text="If added, searching channels won't pop up on the TV screen while browsing."
+            android:text="Link your M3U URL(s) or import a .m3u file so searching never interrupts what's playing on TV."
             android:textColor="@color/text_muted"
             android:textSize="11sp" />
 
         <EditText
             android:id="@+id/etSettingsM3uUrl"
             android:layout_width="match_parent"
-            android:layout_height="44dp"
+            android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
             android:background="@drawable/bg_search_pill"
-            android:hint="https://...playlist.m3u (optional)"
-            android:inputType="textUri"
+            android:gravity="top|start"
+            android:hint="https://...playlist.m3u (1 URL per line)"
+            android:inputType="textMultiLine|textUri"
+            android:maxLines="3"
+            android:minHeight="44dp"
+            android:minLines="1"
             android:paddingStart="14dp"
+            android:paddingTop="10dp"
             android:paddingEnd="14dp"
-            android:singleLine="true"
+            android:paddingBottom="10dp"
             android:textColor="@color/text_primary"
             android:textColorHint="@color/text_muted"
             android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnImportM3uFile"
+            android:layout_width="match_parent"
+            android:layout_height="38dp"
+            android:layout_marginTop="8dp"
+            android:background="@drawable/bg_chip_inactive"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="Import .m3u / .m3u8 File from Phone"
+            android:textColor="@color/accent_gold_bright"
+            android:textSize="12.5sp"
+            android:textStyle="bold" />
 
         <TextView
             android:id="@+id/tvM3uStatus"

@@ -127,6 +127,36 @@
             android:visibility="gone" />
 
         <TextView
+            android:id="@+id/btnDialogSearchLiveTv"
+            android:layout_width="match_parent"
+            android:layout_height="34dp"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_chip_inactive"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="Search Live TV Instead"
+            android:textColor="@color/text_primary"
+            android:textSize="11.5sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/btnDialogSetupSilentM3u"
+            android:layout_width="match_parent"
+            android:layout_height="34dp"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/bg_chip_inactive"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="Link M3U URL / File (Zero TV Interruption)"
+            android:textColor="@color/accent_gold_bright"
+            android:textSize="11.5sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
             android:id="@+id/tvSelectedDirectFeed"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

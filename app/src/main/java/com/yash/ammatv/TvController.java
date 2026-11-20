@@ -19,10 +19,13 @@ public class TvController {
     private static final int ADB_PORT = 5555;
     private static final String OTT_PKG = "studio.scillarium.ottnavigator";
     private static final String OTT_MAIN = OTT_PKG + "/.MainActivity";
-    private static final String OTT_PLAYER = OTT_PKG + ".PlayerActivity";
     private static final String EVDEV_PATH = "/dev/input/event2";
     private static final Pattern VOL_PATTERN = Pattern.compile("volume is (\\d+) in range \\[(\\d+)\\.\\.(\\d+)]");
     private static final Pattern PROVIDER_SUFFIX_PATTERN = Pattern.compile("\\s*\\(\\d+\\s+[^)]+\\)\\s*$");
+    private static final Pattern LEADING_TAG_PATTERN = Pattern.compile("^(?:[\\u2503|\\[\\(][^\\u2503|\\]\\)]+[\\u2503|\\]\\)]\\s*)+");
+    private static final Pattern TRAILING_QUALITY_PATTERN = Pattern.compile(
+            "\\s*\\((?:\\d{3,4}p|hd|fhd|sd|uhd|4k|geo-blocked|not 24/7)[^)]*\\)\\s*$",
+            Pattern.CASE_INSENSITIVE);
 
     private static final SparseIntArray ANDROID_TO_EVDEV = new SparseIntArray();
     static {
@@ -97,6 +100,7 @@ public class TvController {
         public boolean hasMore;
         public int currentPage;
         public boolean isOpenOnTv;
+        public int page0BaseDowns = 2;
         public final List<TvChannelMatch> matches = new ArrayList<>();
         public final Set<String> seenKeys = new LinkedHashSet<>();
 
@@ -148,7 +152,18 @@ public class TvController {
 
     private static class ParsedDump {
         int totalCount = 0;
+        String queryText = "";
+        int baseDowns = 2;
+        boolean searchUiVisible = false;
         final List<SearchRow> rows = new ArrayList<>();
+    }
+
+    private static boolean isOttPlayerResumed(String fg) {
+        return fg != null && fg.contains(OTT_PKG) && fg.contains("PlayerActivity");
+    }
+
+    private static boolean isOttMainResumed(String fg) {
+        return fg != null && fg.contains(OTT_PKG) && fg.contains("MainActivity") && !fg.contains("PlayerActivity");
     }
 
     public static PlayResult playChannel(AdbClient adb, String tvIp, ChannelItem channel,
@@ -170,10 +185,6 @@ public class TvController {
             }
 
             // Tier 2: Dynamic universal search + instant DPAD selection while search is open
-            if (!ensureOttForeground(adb, tvIp, cancelCheck)) {
-                return PlayResult.cancelled();
-            }
-
             String safeQuery = channel.searchQuery == null ? channel.title : channel.searchQuery.trim();
             if (safeQuery.isEmpty()) safeQuery = channel.title;
 
@@ -197,7 +208,7 @@ public class TvController {
 
             ParsedDump dump = parseSearchDump(xml);
             if (dump.rows.isEmpty()) {
-                Thread.sleep(750);
+                Thread.sleep(450);
                 if (isCancelled(cancelCheck)) {
                     closeTvSearchSession(adb, tvIp);
                     return PlayResult.cancelled();
@@ -221,7 +232,7 @@ public class TvController {
             if (bestIndex < 0) {
                 closeTvSearchSession(adb, tvIp);
                 return new PlayResult(false, false, false,
-                        channel.title + " not matched — tap TV in search bar to pick feed", null);
+                        channel.title + " not matched — tap Find on TV to pick feed", null);
             }
 
             SearchRow winner = dump.rows.get(bestIndex);
@@ -229,10 +240,14 @@ public class TvController {
             String displayName = formatDisplayName(baseName);
             String directId = baseName.toLowerCase(Locale.ROOT);
 
-            // Select the winning row directly while search is ALREADY open (0-fork ~320ms!)
-            selectOpenSearchRow(adb, tvIp, bestIndex);
             if (store != null && !directId.isEmpty()) {
                 store.saveDirectChannelId(channel.id, directId);
+            }
+
+            // Select the winning row directly while search is ALREADY open; verify PlayerActivity opened
+            selectOpenSearchRow(adb, tvIp, bestIndex, dump.baseDowns);
+            if (!isCancelled(cancelCheck) && !verifyPlayerStarted(adb, tvIp, 400)) {
+                launchDirectChannel(adb, tvIp, directId, cancelCheck);
             }
             return new PlayResult(true, false, false, "Playing " + displayName, displayName);
         } catch (Exception e) {
@@ -246,14 +261,7 @@ public class TvController {
         try {
             if (isCancelled(cancelCheck)) return PlayResult.cancelled();
 
-            // 1. If the exact TV search page is open right now at page 0, select directly via 0-fork DPAD
-            if (openSession != null && openSession.isOpenOnTv && openSession.currentPage == 0 && match.pageIndex == 0) {
-                selectOpenSearchRow(adb, tvIp, match.rowIndexOnPage);
-                openSession.isOpenOnTv = false;
-                return new PlayResult(true, false, false, "Playing " + match.displayTitle, match.displayTitle);
-            }
-
-            // 2. Try fast 1-step launch by stripped _auto_open_ch_id (works from any scrolled page or M3U cache!)
+            // 1. Primary: Direct 1-step launch by stripped _auto_open_ch_id (works from any page or silent M3U cache!)
             if (launchDirectChannel(adb, tvIp, match.directId, cancelCheck)) {
                 if (openSession != null) openSession.isOpenOnTv = false;
                 if (isCancelled(cancelCheck)) return PlayResult.cancelled();
@@ -261,17 +269,25 @@ public class TvController {
             }
             if (isCancelled(cancelCheck)) return PlayResult.cancelled();
 
-            // 3. Universal fallback: close any stale search, search the exact channel name, select matching row
+            // 2. If the exact TV search page is open right now at page 0, select directly via 0-fork DPAD
+            if (openSession != null && openSession.isOpenOnTv && openSession.currentPage == 0 && match.pageIndex == 0) {
+                selectOpenSearchRow(adb, tvIp, match.rowIndexOnPage, openSession.page0BaseDowns);
+                openSession.isOpenOnTv = false;
+                if (verifyPlayerStarted(adb, tvIp, 450)) {
+                    return new PlayResult(true, false, false, "Playing " + match.displayTitle, match.displayTitle);
+                }
+            }
+            if (isCancelled(cancelCheck)) return PlayResult.cancelled();
+
+            // 3. Last-resort fallback: ONLY search using clean channel keyword (without ┃GROUP┃ prefix!)
             if (openSession != null && openSession.isOpenOnTv) {
                 closeTvSearchSession(adb, tvIp);
                 openSession.isOpenOnTv = false;
             }
-            if (!ensureOttForeground(adb, tvIp, cancelCheck)) {
-                return PlayResult.cancelled();
-            }
 
-            String exactQuery = match.displayTitle;
-            String xml = openSearchAndDumpOnce(adb, tvIp, exactQuery, cancelCheck);
+            String cleanQuery = extractSearchKeyword(match.rawTitle,
+                    openSession != null && !openSession.query.isEmpty() ? openSession.query : match.displayTitle);
+            String xml = openSearchAndDumpOnce(adb, tvIp, cleanQuery, cancelCheck);
             if (isCancelled(cancelCheck)) {
                 closeTvSearchSession(adb, tvIp);
                 return PlayResult.cancelled();
@@ -279,7 +295,7 @@ public class TvController {
 
             ParsedDump dump = parseSearchDump(xml);
             if (dump.rows.isEmpty() && !isCancelled(cancelCheck)) {
-                Thread.sleep(700);
+                Thread.sleep(450);
                 dump = parseSearchDump(dumpUiXml(adb, tvIp));
             }
             if (dump.rows.isEmpty()) {
@@ -288,15 +304,8 @@ public class TvController {
                         "Could not find " + match.displayTitle + " on TV", null);
             }
 
-            int matchIdx = 0;
-            for (int i = 0; i < dump.rows.size(); i++) {
-                String candidateId = extractBaseChannelName(dump.rows.get(i).title).toLowerCase(Locale.ROOT);
-                if (candidateId.equals(match.directId)) {
-                    matchIdx = i;
-                    break;
-                }
-            }
-            selectOpenSearchRow(adb, tvIp, matchIdx);
+            int matchIdx = findBestRowForMatch(dump.rows, match);
+            selectOpenSearchRow(adb, tvIp, matchIdx, dump.baseDowns);
             return new PlayResult(true, false, false, "Playing " + match.displayTitle, match.displayTitle);
         } catch (Exception e) {
             if (isCancelled(cancelCheck)) return PlayResult.cancelled();
@@ -311,10 +320,6 @@ public class TvController {
             if (isCancelled(cancelCheck)) return SearchPageResult.cancelled(session);
             if (session.query.isEmpty()) {
                 return new SearchPageResult(false, false, false, "Enter a channel name to search", session, 0);
-            }
-
-            if (!ensureOttForeground(adb, tvIp, cancelCheck)) {
-                return SearchPageResult.cancelled(session);
             }
 
             String xml = openSearchAndDumpOnce(adb, tvIp, session.query, cancelCheck);
@@ -337,7 +342,7 @@ public class TvController {
 
             ParsedDump dump = parseSearchDump(xml);
             if (dump.rows.isEmpty()) {
-                Thread.sleep(750);
+                Thread.sleep(450);
                 if (isCancelled(cancelCheck)) {
                     closeTvSearchSession(adb, tvIp);
                     return SearchPageResult.cancelled(session);
@@ -350,6 +355,7 @@ public class TvController {
                 dump = parseSearchDump(retryXml);
             }
 
+            session.page0BaseDowns = dump.baseDowns;
             int added = appendRowsToSession(session, dump, 0);
             session.reportedTotal = Math.max(dump.totalCount, session.matches.size());
             session.currentPage = 0;
@@ -370,9 +376,9 @@ public class TvController {
             if (isCancelled(cancelCheck)) return SearchPageResult.cancelled(session);
 
             String xml = adb.runShellCommand(tvIp, ADB_PORT,
-                    "input swipe 400 640 400 180 140; sleep 0.22; "
+                    "input swipe 400 640 400 180 120; sleep 0.12; "
                             + "rm -f /sdcard/ammatv_ui.xml; "
-                            + "uiautomator dump /sdcard/ammatv_ui.xml >/dev/null 2>&1; "
+                            + "uiautomator dump --compressed /sdcard/ammatv_ui.xml >/dev/null 2>&1; "
                             + "cat /sdcard/ammatv_ui.xml",
                     7000);
             if (isCancelled(cancelCheck)) return SearchPageResult.cancelled(session);
@@ -396,9 +402,10 @@ public class TvController {
 
     public static void closeTvSearchSession(AdbClient adb, String tvIp) {
         try {
-            String xmlCheck = adb.runShellCommand(tvIp, ADB_PORT,
-                    "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'", 2000);
-            if (xmlCheck != null && xmlCheck.contains(OTT_MAIN)) {
+            String fg = adb.runShellCommand(tvIp, ADB_PORT,
+                    "dumpsys activity activities | grep mResumedActivity", 2000);
+            // ONLY press BACK if OTT Navigator MainActivity is resumed (NEVER interrupt PlayerActivity!)
+            if (isOttMainResumed(fg)) {
                 sendKey(adb, tvIp, KeyEvent.KEYCODE_BACK);
             }
         } catch (Exception ignored) {
@@ -427,6 +434,16 @@ public class TvController {
         if (rawTitle == null) return "";
         String noEpg = cleanTitle(rawTitle);
         return PROVIDER_SUFFIX_PATTERN.matcher(noEpg).replaceFirst("").trim();
+    }
+
+    public static String extractSearchKeyword(String rawTitle, String fallback) {
+        String base = extractBaseChannelName(rawTitle);
+        String stripped = LEADING_TAG_PATTERN.matcher(base).replaceFirst("").trim();
+        stripped = TRAILING_QUALITY_PATTERN.matcher(stripped).replaceFirst("").trim();
+        stripped = stripped.replace('\u2503', ' ').replace('|', ' ').replaceAll("\\s+", " ").trim();
+        if (!stripped.isEmpty()) return stripped;
+        if (fallback != null && !fallback.trim().isEmpty()) return fallback.trim();
+        return formatDisplayName(base);
     }
 
     public static String formatDisplayName(String cleanBase) {
@@ -476,58 +493,83 @@ public class TvController {
                 }
             }
             if (isCancelled(cancelCheck)) return false;
-            Thread.sleep(1400);
+            Thread.sleep(1100);
         }
         return true;
     }
 
     private static String openSearchAndDumpOnce(AdbClient adb, String tvIp, String query,
                                                 CancelCheck cancelCheck) throws Exception {
-        // Fire ACTION_SEARCH ONCE (never spam it 3 times), wait, then dump UI
+        // Fire ACTION_SEARCH ONCE, wait briefly, then dump compressed UI XML
         String cmd = "am start -a android.intent.action.SEARCH --es query "
                 + shellSingleQuote(query)
                 + " -n " + OTT_MAIN + " >/dev/null 2>&1; "
-                + "sleep 0.9; "
+                + "sleep 0.45; "
                 + "rm -f /sdcard/ammatv_ui.xml; "
-                + "uiautomator dump /sdcard/ammatv_ui.xml >/dev/null 2>&1; "
+                + "uiautomator dump --compressed /sdcard/ammatv_ui.xml >/dev/null 2>&1; "
                 + "cat /sdcard/ammatv_ui.xml";
         String xml = adb.runShellCommand(tvIp, ADB_PORT, cmd, 9000);
         if (isCancelled(cancelCheck)) return null;
 
         if (xml != null && (xml.contains("search_root_layer") || xml.contains("field_search_query"))) {
-            return xml;
+            ParsedDump check = parseSearchDump(xml);
+            if (queriesMatch(check.queryText, query)) {
+                return xml;
+            }
+            // Stale previous search overlay ignored ACTION_SEARCH; dismiss it cleanly and re-run once
+            sendKey(adb, tvIp, KeyEvent.KEYCODE_BACK);
+            Thread.sleep(250);
+            if (isCancelled(cancelCheck)) return null;
+            return adb.runShellCommand(tvIp, ADB_PORT, cmd, 9000);
         }
 
-        // Retry ONLY uiautomator dump once if UI was animating/busy
-        Thread.sleep(800);
+        String fg = adb.runShellCommand(tvIp, ADB_PORT,
+                "dumpsys activity activities | grep mResumedActivity", 2500);
+        if (isCancelled(cancelCheck)) return null;
+        if (fg == null || !fg.contains(OTT_PKG)) {
+            if (!ensureOttForeground(adb, tvIp, cancelCheck)) return null;
+            return adb.runShellCommand(tvIp, ADB_PORT, cmd, 9000);
+        }
+
+        // OTT Navigator is foreground but still animating/opening search
+        Thread.sleep(550);
         if (isCancelled(cancelCheck)) return null;
         xml = dumpUiXml(adb, tvIp);
         if (xml != null && (xml.contains("search_root_layer") || xml.contains("field_search_query"))) {
-            return xml;
+            ParsedDump check = parseSearchDump(xml);
+            if (queriesMatch(check.queryText, query)) {
+                return xml;
+            }
         }
 
-        // If an old search overlay blocked or fragment hadn't initialized, close & fire ONCE more
         sendKey(adb, tvIp, KeyEvent.KEYCODE_BACK);
-        Thread.sleep(350);
+        Thread.sleep(250);
         if (isCancelled(cancelCheck)) return null;
         return adb.runShellCommand(tvIp, ADB_PORT, cmd, 9000);
     }
 
+    private static boolean queriesMatch(String actual, String expected) {
+        String e = expected == null ? "" : expected.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+        String a = actual == null ? "" : actual.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+        if (e.isEmpty() || a.isEmpty()) return true;
+        return a.equals(e) || a.contains(e) || e.contains(a);
+    }
+
     private static String dumpUiXml(AdbClient adb, String tvIp) throws Exception {
         return adb.runShellCommand(tvIp, ADB_PORT,
-                "rm -f /sdcard/ammatv_ui.xml; uiautomator dump /sdcard/ammatv_ui.xml >/dev/null 2>&1; cat /sdcard/ammatv_ui.xml",
+                "rm -f /sdcard/ammatv_ui.xml; uiautomator dump --compressed /sdcard/ammatv_ui.xml >/dev/null 2>&1; cat /sdcard/ammatv_ui.xml",
                 6000);
     }
 
-    private static void selectOpenSearchRow(AdbClient adb, String tvIp, int rowIndex) throws Exception {
-        int downs = 2 + Math.max(0, rowIndex);
-        String fastEv = buildEvdevPrintfCmd(108, downs) + " && " + buildEvdevPrintfCmd(28, 1);
+    private static void selectOpenSearchRow(AdbClient adb, String tvIp, int rowIndex, int baseDowns) throws Exception {
+        int downs = Math.max(1, baseDowns) + Math.max(0, rowIndex);
+        String fastEv = buildEvdevPrintfCmd(108, downs) + " && sleep 0.08 && " + buildEvdevPrintfCmd(28, 1);
         StringBuilder fallback = new StringBuilder("input keyevent");
         for (int i = 0; i < downs; i++) {
             fallback.append(" 20");
         }
         fallback.append(" 23");
-        adb.runShellCommand(tvIp, ADB_PORT, "(" + fastEv + ") || " + fallback, 4500);
+        adb.runShellCommand(tvIp, ADB_PORT, "(" + fastEv + ") || (" + fallback + ")", 4500);
     }
 
     private static boolean launchDirectChannel(AdbClient adb, String tvIp, String directId,
@@ -536,24 +578,65 @@ public class TvController {
         String beforeFg = adb.runShellCommand(tvIp, ADB_PORT,
                 "dumpsys activity activities | grep mResumedActivity", 2500);
         String beforeNorm = beforeFg == null ? "" : beforeFg.trim();
+        boolean wasAlreadyPlayer = isOttPlayerResumed(beforeNorm);
 
         String cmd = "am start -a android.intent.action.VIEW -n " + OTT_MAIN
                 + " -f 0x10008000 --es _auto_open_ch_id " + shellSingleQuote(directId)
                 + " >/dev/null 2>&1";
         adb.runShellCommand(tvIp, ADB_PORT, cmd, 4500);
 
-        int[] waits = new int[]{450, 650, 800, 900};
+        int[] waits = new int[]{350, 450, 600, 750, 900};
+        boolean sawTransition = false;
+        String lastFg = beforeNorm;
         for (int waitMs : waits) {
             if (isCancelled(cancelCheck)) return false;
             Thread.sleep(waitMs);
             String fg = adb.runShellCommand(tvIp, ADB_PORT,
                     "dumpsys activity activities | grep mResumedActivity", 2500);
             String fgNorm = fg == null ? "" : fg.trim();
-            if (fgNorm.contains(OTT_PLAYER) && !fgNorm.equals(beforeNorm)) {
+            lastFg = fgNorm;
+            if (!fgNorm.equals(beforeNorm)) {
+                sawTransition = true;
+            }
+            if (isOttPlayerResumed(fgNorm) && (!wasAlreadyPlayer || sawTransition)) {
                 return true;
             }
         }
+        return isOttPlayerResumed(lastFg) && !wasAlreadyPlayer;
+    }
+
+    private static boolean verifyPlayerStarted(AdbClient adb, String tvIp, int initialWaitMs) {
+        try {
+            int[] waits = new int[]{initialWaitMs, 450};
+            for (int w : waits) {
+                if (w > 0) Thread.sleep(w);
+                String fg = adb.runShellCommand(tvIp, ADB_PORT,
+                        "dumpsys activity activities | grep mResumedActivity", 2000);
+                if (isOttPlayerResumed(fg)) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {
+        }
         return false;
+    }
+
+    private static int findBestRowForMatch(List<SearchRow> rows, TvChannelMatch match) {
+        for (int i = 0; i < rows.size(); i++) {
+            String candidateId = extractBaseChannelName(rows.get(i).title).toLowerCase(Locale.ROOT);
+            if (candidateId.equals(match.directId)) {
+                return i;
+            }
+        }
+        String targetNorm = normalizeForMatch(
+                extractSearchKeyword(match.rawTitle, match.displayTitle).toUpperCase(Locale.ROOT));
+        for (int i = 0; i < rows.size(); i++) {
+            String candNorm = normalizeForMatch(extractBaseChannelName(rows.get(i).title).toUpperCase(Locale.ROOT));
+            if (!targetNorm.isEmpty() && candNorm.contains(targetNorm)) {
+                return i;
+            }
+        }
+        return 0;
     }
 
     public static VolumeState getVolume(AdbClient adb, String tvIp) throws Exception {
@@ -662,8 +745,24 @@ public class TvController {
                         String resId = parser.getAttributeValue(null, "resource-id");
                         String clickable = parser.getAttributeValue(null, "clickable");
                         String text = parser.getAttributeValue(null, "text");
+                        boolean isFocused = "true".equals(parser.getAttributeValue(null, "focused"));
 
-                        if ((OTT_PKG + ":id/item_count").equals(resId) && text != null && dump.totalCount == 0) {
+                        if ((OTT_PKG + ":id/search_root_layer").equals(resId)) {
+                            dump.searchUiVisible = true;
+                        } else if ((OTT_PKG + ":id/field_search_query").equals(resId)) {
+                            dump.searchUiVisible = true;
+                            if (text != null) {
+                                dump.queryText = text;
+                            }
+                            if (isFocused) {
+                                dump.baseDowns = 2;
+                            }
+                        } else if ((OTT_PKG + ":id/search_filter_all").equals(resId)
+                                || (OTT_PKG + ":id/search_filter_live").equals(resId)) {
+                            if (isFocused) {
+                                dump.baseDowns = 1;
+                            }
+                        } else if ((OTT_PKG + ":id/item_count").equals(resId) && text != null && dump.totalCount == 0) {
                             String digits = text.replaceAll("[^0-9]", "");
                             if (!digits.isEmpty()) {
                                 try {
